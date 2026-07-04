@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -162,6 +163,41 @@ func TestACPUnknownSessionPromptErrors(t *testing.T) {
 	err := h.client.Call(ctx, MethodSessionPrompt, PromptParams{SessionID: "nope", Prompt: []ContentBlock{TextBlock("x")}}, &PromptResult{})
 	if err == nil {
 		t.Fatal("expected error for unknown session")
+	}
+}
+
+// TestPersistTurnLogsAppendEventFailures proves that a persistence failure
+// (previously silently discarded via `_, _ = ...AppendEvent(...)`) now gets
+// logged instead of vanishing without a trace. An invalid session id makes
+// AppendEvent fail deterministically without needing to break the store.
+func TestPersistTurnLogsAppendEventFailures(t *testing.T) {
+	store := sessions.NewStore(sessions.StoreOptions{RootDir: t.TempDir()})
+	a := &Agent{deps: Deps{Store: store}}
+	sess := &acpSession{id: "not a valid session id!!"}
+
+	origStderr := os.Stderr
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stderr = write
+
+	a.persistTurn(sess, "hello", "world")
+
+	if err := write.Close(); err != nil {
+		t.Fatalf("close pipe writer: %v", err)
+	}
+	os.Stderr = origStderr
+
+	captured, err := io.ReadAll(read)
+	if err != nil {
+		t.Fatalf("read captured stderr: %v", err)
+	}
+	output := string(captured)
+	for _, want := range []string{"failed to persist user turn", "failed to persist assistant turn"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("expected stderr to contain %q, got %q", want, output)
+		}
 	}
 }
 

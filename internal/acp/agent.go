@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
 	"strings"
 	"sync"
 
@@ -388,15 +390,21 @@ func (a *Agent) modeState(s *acpSession) *SessionModeState {
 
 func (a *Agent) persistTurn(sess *acpSession, user, assistant string) {
 	if a.deps.Store != nil {
-		_, _ = a.deps.Store.AppendEvent(sess.id, sessions.AppendEventInput{
+		if _, err := a.deps.Store.AppendEvent(sess.id, sessions.AppendEventInput{
 			Type:    sessions.EventMessage,
 			Payload: map[string]any{"role": "user", "content": user},
-		})
+		}); err != nil {
+			// best-effort; log at least so we notice history loss
+			// (real fix would surface to transcript / user)
+			fmt.Fprintf(os.Stderr, "warning: failed to persist user turn: %v\n", err)
+		}
 		if assistant != "" {
-			_, _ = a.deps.Store.AppendEvent(sess.id, sessions.AppendEventInput{
+			if _, err := a.deps.Store.AppendEvent(sess.id, sessions.AppendEventInput{
 				Type:    sessions.EventMessage,
 				Payload: map[string]any{"role": "assistant", "content": assistant},
-			})
+			}); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: failed to persist assistant turn: %v\n", err)
+			}
 		}
 	}
 	sess.appendHistory(turnRecord{user: user, assistant: assistant})
