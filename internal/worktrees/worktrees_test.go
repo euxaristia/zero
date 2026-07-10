@@ -248,3 +248,66 @@ func fixedTime(value string) func() time.Time {
 	}
 	return func() time.Time { return parsed }
 }
+
+func TestCleanPrunesStaleWorktrees(t *testing.T) {
+	tempDir := t.TempDir()
+	baseDir := filepath.Join(tempDir, "zero-worktrees")
+	repoRoot := filepath.Join(tempDir, "repo")
+
+	// Create directories representing two worktrees: one young, one stale.
+	youngPath := filepath.Join(baseDir, "young-task")
+	stalePath := filepath.Join(baseDir, "stale-task")
+	if err := os.MkdirAll(youngPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(stalePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(repoRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Change mtime of stale-task to be in the past (e.g. 2 days ago).
+	twoDaysAgo := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(stalePath, twoDaysAgo, twoDaysAgo); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &fakeRunner{
+		results: []CommandResult{
+			{Stdout: repoRoot}, // rev-parse --show-toplevel
+			{Stdout: "worktree " + youngPath + "\nworktree " + stalePath + "\n"}, // worktree list --porcelain
+			{ExitCode: 0}, // worktree remove --force <stalePath>
+			{ExitCode: 0}, // worktree prune
+		},
+	}
+
+	options := Options{
+		Cwd:     repoRoot,
+		BaseDir: baseDir,
+		RunGit:  runner.Run,
+	}
+
+	err := Clean(context.Background(), options, 24*time.Hour)
+	if err != nil {
+		t.Fatalf("Clean failed: %v", err)
+	}
+
+	// Verify the calls made by Clean
+	if len(runner.calls) != 4 {
+		t.Fatalf("expected 4 git calls, got %d", len(runner.calls))
+	}
+	if runner.commandLine(0) != "git rev-parse --show-toplevel" {
+		t.Errorf("call 0 = %q", runner.commandLine(0))
+	}
+	if runner.commandLine(1) != "git worktree list --porcelain" {
+		t.Errorf("call 1 = %q", runner.commandLine(1))
+	}
+	expectedRemoveCall := "git worktree remove --force " + filepath.Clean(stalePath)
+	if runner.commandLine(2) != expectedRemoveCall {
+		t.Errorf("call 2 = %q, want %q", runner.commandLine(2), expectedRemoveCall)
+	}
+	if runner.commandLine(3) != "git worktree prune" {
+		t.Errorf("call 3 = %q", runner.commandLine(3))
+	}
+}

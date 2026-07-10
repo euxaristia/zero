@@ -50,11 +50,11 @@ func TestRedactNestedSecretStillRemovesWholeBlock(t *testing.T) {
 	// AWS key shape, which sorts before private_key_block). Redaction must remove
 	// the WHOLE block: if the inner match were replaced first it would corrupt the
 	// block's exact string and leave the BEGIN/END header in the output.
-	key := "-----BEGIN PRIVATE KEY-----\nAKIAABCDEFGHIJKLMNOP\nMIIEowIBAAKCAQEAbody\n-----END PRIVATE KEY-----"
+	key := "-----BEGIN PRIVATE KEY-----\nAKIAIOSFODNN7EXAMPLE\nMIIEowIBAAKCAQEAbody\n-----END PRIVATE KEY-----"
 	text := "leaked:\n" + key + "\ndone"
 
 	redacted, _ := Redact(text)
-	for _, leaked := range []string{"PRIVATE KEY", "AKIAABCDEFGHIJKLMNOP", "MIIEowIBAAKCAQEAbody"} {
+	for _, leaked := range []string{"PRIVATE KEY", "AKIAIOSFODNN7EXAMPLE", "MIIEowIBAAKCAQEAbody"} {
 		if strings.Contains(redacted, leaked) {
 			t.Fatalf("redaction leaked %q from a nested-secret block: %q", leaked, redacted)
 		}
@@ -118,5 +118,35 @@ func TestScanDetectsModernPrefixedOpenAIKeys(t *testing.T) {
 		if !strings.Contains(redacted, "[REDACTED:openai_key]") {
 			t.Fatalf("missing typed placeholder for %q: %q", key, redacted)
 		}
+	}
+}
+
+func TestScanRedactsLongerKeysWithoutTailLeak(t *testing.T) {
+	cases := []struct {
+		wantType string
+		secret   string
+	}{
+		{"github_token", "ghp_1234567890abcdefghijklmnopqrstuvwxyz1234567890abcdef"}, // 50 chars instead of 40
+		{"google_api_key", "AIzaSyA1234567890abcdefghijklmnopqrstuv12345678"},        // 50 chars instead of 39
+	}
+	for _, tc := range cases {
+		text := "longer key is " + tc.secret + " in text"
+		redacted, findings := Redact(text)
+		if len(findings) != 1 || findings[0].Type != tc.wantType {
+			t.Errorf("expected one %s finding, got %#v", tc.wantType, findings)
+			continue
+		}
+		wantRedacted := "longer key is [REDACTED:" + tc.wantType + "] in text"
+		if redacted != wantRedacted {
+			t.Errorf("redacted = %q, want %q", redacted, wantRedacted)
+		}
+	}
+}
+
+func TestScanIgnoresKebabCaseStartingWithSk(t *testing.T) {
+	phrase := "sk-learn-machine-learning-model"
+	findings := Scan("testing " + phrase + " in text")
+	if len(findings) != 0 {
+		t.Errorf("expected no match for non-secret kebab-case phrase %q, got: %#v", phrase, findings)
 	}
 }

@@ -44,6 +44,11 @@ type Result struct {
 var worktreeNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$`)
 
 func Prepare(ctx context.Context, options Options) (Result, error) {
+	// Clean up stale worktrees (older than 24 hours) automatically to prevent disk space leaks.
+	if options.RunGit == nil {
+		_ = Clean(ctx, options, 24*time.Hour)
+	}
+
 	cwd, err := resolveCwd(options.Cwd)
 	if err != nil {
 		return Result{}, err
@@ -297,4 +302,71 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// Clean prunes any zero-owned git worktrees older than maxAge to prevent disk space leaks.
+func Clean(ctx context.Context, options Options, maxAge time.Duration) error {
+	cwd, err := resolveCwd(options.Cwd)
+	if err != nil {
+		return err
+	}
+	runGit := options.RunGit
+	if runGit == nil {
+		runGit = defaultRunGit
+	}
+	repoRoot, err := gitOutput(ctx, runGit, cwd, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return fmt.Errorf("not a git repository: %w", err)
+	}
+	repoRoot = filepath.Clean(repoRoot)
+
+	baseDir := strings.TrimSpace(options.BaseDir)
+	if baseDir == "" {
+		baseDir, err = DefaultBaseDir(options.Env)
+		if err != nil {
+			return err
+		}
+	}
+	baseDir, err = filepath.Abs(baseDir)
+	if err != nil {
+		return err
+	}
+
+	output, err := gitOutput(ctx, runGit, repoRoot, "worktree", "list", "--porcelain")
+	if err != nil {
+		return fmt.Errorf("list git worktrees: %w", err)
+	}
+
+	lines := strings.Split(output, "\n")
+	var lastErr error
+	for _, line := range lines {
+		if !strings.HasPrefix(line, "worktree ") {
+			continue
+		}
+		path := strings.TrimPrefix(line, "worktree ")
+		path = filepath.Clean(path)
+
+		// Only prune worktrees that belong to zero (i.e. inside baseDir)
+		if !strings.HasPrefix(path, baseDir) {
+			continue
+		}
+
+		info, err := os.Stat(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				_, _ = runGit(ctx, repoRoot, "worktree", "prune")
+			}
+			continue
+		}
+
+		if time.Since(info.ModTime()) > maxAge {
+			_, err = runGit(ctx, repoRoot, "worktree", "remove", "--force", path)
+			if err != nil {
+				lastErr = fmt.Errorf("remove worktree %s: %w", path, err)
+			}
+		}
+	}
+
+	_, _ = runGit(ctx, repoRoot, "worktree", "prune")
+	return lastErr
 }
