@@ -4,7 +4,7 @@ Zero is distributed as:
 
 - an npm package, `@gitlawb/zero`
 - release archives on GitHub Releases
-- source builds with Go 1.25+
+- source builds with Go 1.26+
 
 The npm package and install scripts download a platform-specific release archive.
 They require a published GitHub Release for the requested version.
@@ -151,7 +151,7 @@ Build a local binary:
 go build -o zero ./cmd/zero
 ```
 
-Source builds require Go 1.25+.
+Source builds require Go 1.26+.
 
 ### Sandbox Helpers For Source Builds
 
