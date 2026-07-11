@@ -30,19 +30,27 @@ type pattern struct {
 // mid-word — e.g. "sk-" inside "task-management-and-coordination" must NOT match
 // as an openai_key. Real secrets are preceded by a delimiter (space, quote, =, :,
 // start-of-string), all of which satisfy \b.
+//
+// A trailing \b is omitted on patterns whose body class allows "-": \b only
+// matches at a word/non-word transition, so a secret that ends in "-" right
+// before a non-word delimiter (space, end of string) has no such transition,
+// and the engine backtracks the greedy quantifier to drop that last
+// character rather than fail the match, leaving the trailing "-" un-redacted.
+// The body character class is itself the real stopping boundary once the
+// input runs out of allowed characters, so the anchor is unnecessary there.
 var patterns = []pattern{
 	{"aws_access_key_id", regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`)},
 	{"github_token", regexp.MustCompile(`\bgh[pousr]_[A-Za-z0-9]{36,}\b`)},
 	{"github_pat", regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{22,}\b`)},
-	{"slack_token", regexp.MustCompile(`\bxox[baprs]-[A-Za-z0-9-]{10,}\b`)},
-	{"google_api_key", regexp.MustCompile(`\bAIza[0-9A-Za-z\-_]{35,}\b`)},
+	{"slack_token", regexp.MustCompile(`\bxox[baprs]-[A-Za-z0-9-]{10,}`)},
+	{"google_api_key", regexp.MustCompile(`\bAIza[0-9A-Za-z\-_]{35,}`)},
 	// Distinguish modern prefixed keys (sk-proj- / sk-svcacct-) from normal kebab-case phrases,
 	// and match legacy sk-<alnum> keys by length (>= 20).
-	{"openai_key", regexp.MustCompile(`\bsk-(?:proj-|svcacct-)[A-Za-z0-9_-]{20,}\b|\bsk-[A-Za-z0-9]{20,}\b`)},
+	{"openai_key", regexp.MustCompile(`\bsk-(?:proj-|svcacct-)[A-Za-z0-9_-]{20,}|\bsk-[A-Za-z0-9]{20,}\b`)},
 	// Match the ENTIRE PEM/OpenSSH block (header THROUGH the END marker, body
 	// included) so redaction removes the key material, not just the header.
 	{"private_key_block", regexp.MustCompile(`(?s)-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----.*?-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----`)},
-	{"jwt", regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`)},
+	{"jwt", regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`)},
 }
 
 // Scan returns the distinct secrets found in text (deduplicated by match,

@@ -311,3 +311,172 @@ func TestCleanPrunesStaleWorktrees(t *testing.T) {
 		t.Errorf("call 3 = %q", runner.commandLine(3))
 	}
 }
+
+// A worktree with a stale top-level mtime but a file that was written deep
+// inside the tree more recently must not be pruned: the directory's own mtime
+// only changes when an entry is added/removed/renamed directly inside it, not
+// when a long-running task edits an existing nested file.
+func TestCleanSkipsWorktreeWithRecentNestedActivity(t *testing.T) {
+	tempDir := t.TempDir()
+	baseDir := filepath.Join(tempDir, "zero-worktrees")
+	repoRoot := filepath.Join(tempDir, "repo")
+
+	activePath := filepath.Join(baseDir, "active-task")
+	nestedDir := filepath.Join(activePath, "internal", "pkg")
+	if err := os.MkdirAll(nestedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(repoRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	twoDaysAgo := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(activePath, twoDaysAgo, twoDaysAgo); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(nestedDir, twoDaysAgo, twoDaysAgo); err != nil {
+		t.Fatal(err)
+	}
+
+	// The file itself is freshly written (default mtime is now), simulating a
+	// task actively editing code deep in the worktree.
+	nestedFile := filepath.Join(nestedDir, "handler.go")
+	if err := os.WriteFile(nestedFile, []byte("package pkg"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &fakeRunner{
+		results: []CommandResult{
+			{Stdout: repoRoot},
+			{Stdout: "worktree " + activePath + "\n"},
+			{ExitCode: 0}, // worktree prune
+		},
+	}
+
+	if err := Clean(context.Background(), Options{Cwd: repoRoot, BaseDir: baseDir, RunGit: runner.Run}, 24*time.Hour); err != nil {
+		t.Fatalf("Clean failed: %v", err)
+	}
+
+	for _, call := range runner.calls {
+		if len(call.args) > 0 && call.args[0] == "remove" {
+			t.Fatalf("Clean removed an actively-edited worktree: %v", call.args)
+		}
+	}
+}
+
+// A worktree explicitly locked via `git worktree lock` must never be pruned,
+// regardless of how stale its mtime looks.
+func TestCleanSkipsLockedWorktree(t *testing.T) {
+	tempDir := t.TempDir()
+	baseDir := filepath.Join(tempDir, "zero-worktrees")
+	repoRoot := filepath.Join(tempDir, "repo")
+
+	lockedPath := filepath.Join(baseDir, "locked-task")
+	if err := os.MkdirAll(lockedPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(repoRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	twoDaysAgo := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(lockedPath, twoDaysAgo, twoDaysAgo); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &fakeRunner{
+		results: []CommandResult{
+			{Stdout: repoRoot},
+			{Stdout: "worktree " + lockedPath + "\nHEAD abc1234\nlocked in use by zero\n"},
+			{ExitCode: 0}, // worktree prune
+		},
+	}
+
+	if err := Clean(context.Background(), Options{Cwd: repoRoot, BaseDir: baseDir, RunGit: runner.Run}, 24*time.Hour); err != nil {
+		t.Fatalf("Clean failed: %v", err)
+	}
+
+	for _, call := range runner.calls {
+		if len(call.args) > 0 && call.args[0] == "remove" {
+			t.Fatalf("Clean removed a locked worktree: %v", call.args)
+		}
+	}
+}
+
+// A sibling directory that merely shares baseDir as a string prefix (e.g.
+// "<baseDir>-other") must not be treated as zero-owned.
+func TestCleanRejectsSiblingDirWithSharedPrefix(t *testing.T) {
+	tempDir := t.TempDir()
+	baseDir := filepath.Join(tempDir, "zero-worktrees")
+	siblingDir := baseDir + "-other"
+	repoRoot := filepath.Join(tempDir, "repo")
+
+	siblingPath := filepath.Join(siblingDir, "not-ours")
+	if err := os.MkdirAll(siblingPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(repoRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	twoDaysAgo := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(siblingPath, twoDaysAgo, twoDaysAgo); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &fakeRunner{
+		results: []CommandResult{
+			{Stdout: repoRoot},
+			{Stdout: "worktree " + siblingPath + "\n"},
+			{ExitCode: 0}, // worktree prune
+		},
+	}
+
+	if err := Clean(context.Background(), Options{Cwd: repoRoot, BaseDir: baseDir, RunGit: runner.Run}, 24*time.Hour); err != nil {
+		t.Fatalf("Clean failed: %v", err)
+	}
+
+	for _, call := range runner.calls {
+		if len(call.args) > 0 && call.args[0] == "remove" {
+			t.Fatalf("Clean removed a sibling directory outside baseDir: %v", call.args)
+		}
+	}
+}
+
+func TestIsUnderDir(t *testing.T) {
+	base := filepath.Join(string(filepath.Separator), "a", "base")
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{filepath.Join(base, "child"), true},
+		{filepath.Join(base, "nested", "deeper"), true},
+		{base, true},
+		{base + "-other", false},
+		{base + "-other" + string(filepath.Separator) + "child", false},
+		{filepath.Join(string(filepath.Separator), "a", "elsewhere"), false},
+	}
+	for _, c := range cases {
+		if got := isUnderDir(c.path, base); got != c.want {
+			t.Errorf("isUnderDir(%q, %q) = %v, want %v", c.path, base, got, c.want)
+		}
+	}
+}
+
+func TestParseWorktreeListTracksLockedState(t *testing.T) {
+	output := "worktree /a/one\nHEAD abc\nbranch refs/heads/main\n\n" +
+		"worktree /a/two\nHEAD def\nlocked\n\n" +
+		"worktree /a/three\nHEAD ghi\nlocked some reason\ndetached\n"
+
+	entries := parseWorktreeList(output)
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 entries, got %d: %#v", len(entries), entries)
+	}
+	if entries[0].path != filepath.Clean("/a/one") || entries[0].locked {
+		t.Errorf("entries[0] = %#v", entries[0])
+	}
+	if entries[1].path != filepath.Clean("/a/two") || !entries[1].locked {
+		t.Errorf("entries[1] = %#v", entries[1])
+	}
+	if entries[2].path != filepath.Clean("/a/three") || !entries[2].locked {
+		t.Errorf("entries[2] = %#v", entries[2])
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -337,36 +338,111 @@ func Clean(ctx context.Context, options Options, maxAge time.Duration) error {
 		return fmt.Errorf("list git worktrees: %w", err)
 	}
 
-	lines := strings.Split(output, "\n")
+	cutoff := time.Now().Add(-maxAge)
 	var lastErr error
-	for _, line := range lines {
-		if !strings.HasPrefix(line, "worktree ") {
-			continue
-		}
-		path := strings.TrimPrefix(line, "worktree ")
-		path = filepath.Clean(path)
-
-		// Only prune worktrees that belong to zero (i.e. inside baseDir)
-		if !strings.HasPrefix(path, baseDir) {
+	for _, entry := range parseWorktreeList(output) {
+		// A worktree a caller has explicitly locked (git worktree lock) is
+		// never a prune candidate, regardless of its mtime.
+		if entry.locked {
 			continue
 		}
 
-		info, err := os.Stat(path)
+		// Only prune worktrees that belong to zero (i.e. inside baseDir), using
+		// a path-boundary-safe comparison so a sibling directory that merely
+		// shares baseDir as a string prefix (e.g. "<baseDir>-other") can't match.
+		if !isUnderDir(entry.path, baseDir) {
+			continue
+		}
+
+		info, err := os.Stat(entry.path)
 		if err != nil {
 			if os.IsNotExist(err) {
 				_, _ = runGit(ctx, repoRoot, "worktree", "prune")
 			}
 			continue
 		}
+		if !info.IsDir() {
+			continue
+		}
 
-		if time.Since(info.ModTime()) > maxAge {
-			_, err = runGit(ctx, repoRoot, "worktree", "remove", "--force", path)
+		if worktreeIsStale(entry.path, cutoff) {
+			_, err = runGit(ctx, repoRoot, "worktree", "remove", "--force", entry.path)
 			if err != nil {
-				lastErr = fmt.Errorf("remove worktree %s: %w", path, err)
+				lastErr = fmt.Errorf("remove worktree %s: %w", entry.path, err)
 			}
 		}
 	}
 
 	_, _ = runGit(ctx, repoRoot, "worktree", "prune")
 	return lastErr
+}
+
+type worktreeEntry struct {
+	path   string
+	locked bool
+}
+
+// parseWorktreeList reads `git worktree list --porcelain` output into one
+// entry per worktree. Entries are delimited by their own "worktree <path>"
+// line rather than by blank-line blocks, so this tolerates both real git
+// output (attribute lines plus a blank-line separator) and a minimal listing
+// with no separators.
+func parseWorktreeList(output string) []worktreeEntry {
+	var entries []worktreeEntry
+	var current *worktreeEntry
+	for _, line := range strings.Split(output, "\n") {
+		switch {
+		case strings.HasPrefix(line, "worktree "):
+			if current != nil {
+				entries = append(entries, *current)
+			}
+			current = &worktreeEntry{path: filepath.Clean(strings.TrimPrefix(line, "worktree "))}
+		case current != nil && (line == "locked" || strings.HasPrefix(line, "locked ")):
+			current.locked = true
+		}
+	}
+	if current != nil {
+		entries = append(entries, *current)
+	}
+	return entries
+}
+
+// isUnderDir reports whether path is dir itself or a descendant of it. Unlike
+// a bare strings.HasPrefix(path, dir), this rejects a sibling that merely
+// shares dir as a string prefix (e.g. dir "/a/base" must not match
+// "/a/base-other"), and filepath.Rel makes the comparison Windows-correct.
+func isUnderDir(path, dir string) bool {
+	rel, err := filepath.Rel(dir, path)
+	if err != nil {
+		return false
+	}
+	if rel == "." {
+		return true
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// worktreeIsStale reports whether every file under root was last modified
+// before cutoff. A directory's own mtime only changes when an entry is
+// added, removed, or renamed directly inside it, not when a long-running
+// task edits files deeper in the tree, so checking root's mtime alone can
+// mistake an actively-used worktree for stale. Walking the tree and bailing
+// out on the first recent entry avoids that false positive.
+func worktreeIsStale(root string, cutoff time.Time) bool {
+	stale := true
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if info.ModTime().After(cutoff) {
+			stale = false
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return stale
 }

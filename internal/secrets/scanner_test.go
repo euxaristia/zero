@@ -143,6 +143,38 @@ func TestScanRedactsLongerKeysWithoutTailLeak(t *testing.T) {
 	}
 }
 
+// Patterns whose body class allows "-" (slack_token, google_api_key, the
+// modern openai_key branch, jwt) must redact a secret that ends in "-" right
+// before a delimiter: a trailing \b anchor would have no word/non-word
+// transition to match there, forcing the engine to drop that last character
+// from the match and leaking it.
+func TestScanRedactsTrailingHyphenWithoutTailLeak(t *testing.T) {
+	cases := []struct {
+		wantType string
+		secret   string
+	}{
+		{"slack_token", "xoxb-1234567890-abcdefghi-"},
+		{"google_api_key", "AIzaSyA1234567890abcdefghijklmnopqrstu-"},
+		{"openai_key", "sk-proj-abcDEF123_ghiJKL456-mnoPQR789st-"},
+		{"jwt", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fw-"},
+	}
+	for _, tc := range cases {
+		text := "secret is " + tc.secret + " end"
+		redacted, findings := Redact(text)
+		if len(findings) != 1 || findings[0].Type != tc.wantType {
+			t.Errorf("%s: expected one finding for %q, got %#v", tc.wantType, tc.secret, findings)
+			continue
+		}
+		if strings.Contains(redacted, "-  end") || strings.Contains(redacted, "-] end") {
+			t.Errorf("%s: trailing hyphen leaked: %q", tc.wantType, redacted)
+		}
+		wantRedacted := "secret is [REDACTED:" + tc.wantType + "] end"
+		if redacted != wantRedacted {
+			t.Errorf("%s: redacted = %q, want %q", tc.wantType, redacted, wantRedacted)
+		}
+	}
+}
+
 func TestScanIgnoresKebabCaseStartingWithSk(t *testing.T) {
 	phrase := "sk-learn-machine-learning-model"
 	findings := Scan("testing " + phrase + " in text")
