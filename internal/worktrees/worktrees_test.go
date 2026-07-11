@@ -312,6 +312,66 @@ func TestCleanPrunesStaleWorktrees(t *testing.T) {
 	}
 }
 
+// defaultRunGit deliberately returns a nil error alongside a nonzero
+// CommandResult.ExitCode for a failed git invocation (see its comment), so
+// Clean must check ExitCode itself rather than trusting a nil error to mean
+// the removal succeeded.
+func TestCleanReportsErrorOnFailedRemoval(t *testing.T) {
+	tempDir := t.TempDir()
+	baseDir := filepath.Join(tempDir, "zero-worktrees")
+	repoRoot := filepath.Join(tempDir, "repo")
+
+	stalePath := filepath.Join(baseDir, "stale-task")
+	if err := os.MkdirAll(stalePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(repoRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	twoDaysAgo := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(stalePath, twoDaysAgo, twoDaysAgo); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &fakeRunner{
+		results: []CommandResult{
+			{Stdout: repoRoot},
+			{Stdout: "worktree " + stalePath + "\n"},
+			{ExitCode: 1, Stderr: "fatal: unable to remove worktree: in use"},
+			{ExitCode: 0},
+		},
+	}
+
+	err := Clean(context.Background(), Options{Cwd: repoRoot, BaseDir: baseDir, RunGit: runner.Run}, 24*time.Hour)
+	if err == nil {
+		t.Fatal("expected Clean to report the failed removal")
+	}
+	if !strings.Contains(err.Error(), "in use") {
+		t.Errorf("error = %q, want it to include the git failure message", err.Error())
+	}
+}
+
+// An inspection failure (the root can't be stat'd or walked) must fail
+// closed: worktreeIsStale reports false rather than true, so an incomplete
+// inspection can never authorize a forced removal.
+func TestWorktreeIsStaleFailsClosedOnInspectionError(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	if worktreeIsStale(missing, time.Now()) {
+		t.Fatal("expected worktreeIsStale to fail closed for an uninspectable root")
+	}
+}
+
+func TestWorktreeIsStaleTrueForOldUntouchedTree(t *testing.T) {
+	dir := t.TempDir()
+	old := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(dir, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if !worktreeIsStale(dir, time.Now().Add(-24*time.Hour)) {
+		t.Fatal("expected an old, untouched directory to be reported stale")
+	}
+}
+
 // A worktree with a stale top-level mtime but a file that was written deep
 // inside the tree more recently must not be pruned: the directory's own mtime
 // only changes when an entry is added/removed/renamed directly inside it, not

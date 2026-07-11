@@ -366,8 +366,12 @@ func Clean(ctx context.Context, options Options, maxAge time.Duration) error {
 		}
 
 		if worktreeIsStale(entry.path, cutoff) {
-			_, err = runGit(ctx, repoRoot, "worktree", "remove", "--force", entry.path)
-			if err != nil {
+			// gitOutput (not a raw runGit call) so a nonzero exit code is
+			// reported as a failure: defaultRunGit deliberately returns a nil
+			// error alongside a nonzero CommandResult.ExitCode for a failed git
+			// invocation, so checking only the returned error would silently
+			// treat a failed removal (busy, permission denied) as success.
+			if _, err := gitOutput(ctx, runGit, repoRoot, "worktree", "remove", "--force", entry.path); err != nil {
 				lastErr = fmt.Errorf("remove worktree %s: %w", entry.path, err)
 			}
 		}
@@ -428,15 +432,21 @@ func isUnderDir(path, dir string) bool {
 // task edits files deeper in the tree, so checking root's mtime alone can
 // mistake an actively-used worktree for stale. Walking the tree and bailing
 // out on the first recent entry avoids that false positive.
+//
+// Any inspection failure (a WalkDir error, or a DirEntry that can't report its
+// own info) fails closed: it's treated the same as "not stale," never as
+// "stale," so an incomplete inspection can't authorize a forced removal.
 func worktreeIsStale(root string, cutoff time.Time) bool {
 	stale := true
-	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil
+			stale = false
+			return filepath.SkipAll
 		}
 		info, err := d.Info()
 		if err != nil {
-			return nil
+			stale = false
+			return filepath.SkipAll
 		}
 		if info.ModTime().After(cutoff) {
 			stale = false
@@ -444,5 +454,5 @@ func worktreeIsStale(root string, cutoff time.Time) bool {
 		}
 		return nil
 	})
-	return stale
+	return stale && walkErr == nil
 }
