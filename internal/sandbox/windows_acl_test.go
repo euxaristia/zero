@@ -52,6 +52,29 @@ func TestBuildWindowsACLPlanForWorkspaceWriteProfile(t *testing.T) {
 	assertWindowsACLEntry(t, plan, WindowsACLDenyWrite, `C:\workspace\secret-write`, cacheSID, false)
 	assertWindowsACLEntry(t, plan, WindowsACLDenyRead, `C:\workspace\secret-read`, workspaceSID, true)
 	assertWindowsACLEntry(t, plan, WindowsACLDenyRead, `C:\workspace\secret-read`, cacheSID, true)
+
+	caps, err := LoadOrCreateWindowsCapabilitySIDs(home)
+	if err != nil {
+		t.Fatalf("LoadOrCreateWindowsCapabilitySIDs: %v", err)
+	}
+	systemDrive := os.Getenv("SystemDrive")
+	if systemDrive == "" {
+		systemDrive = "C:"
+	}
+	systemRoot := os.Getenv("SystemRoot")
+	if systemRoot == "" {
+		systemRoot = systemDrive + `\Windows`
+	}
+	programData := os.Getenv("ProgramData")
+	if programData == "" {
+		programData = systemDrive + `\ProgramData`
+	}
+
+	for _, sid := range []string{workspaceSID, cacheSID, caps.ReadOnly} {
+		assertWindowsACLEntryExt(t, plan, WindowsACLDenyWrite, systemDrive+`\`, sid, false, true)
+		assertWindowsACLEntryExt(t, plan, WindowsACLDenyWrite, programData, sid, false, false)
+		assertWindowsACLEntryExt(t, plan, WindowsACLDenyWrite, systemRoot+`\Temp`, sid, false, false)
+	}
 }
 
 func TestBuildWindowsACLPlanUsesReadOnlySIDWithoutWriteRoots(t *testing.T) {
@@ -73,10 +96,25 @@ func TestBuildWindowsACLPlanUsesReadOnlySIDWithoutWriteRoots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildWindowsACLPlan: %v", err)
 	}
-	if len(plan.Entries) != 1 {
-		t.Fatalf("ACL entries = %#v, want one deny-read entry", plan.Entries)
+	if len(plan.Entries) != 4 {
+		t.Fatalf("ACL entries = %#v, want four entries (1 deny-read, 3 deny-write)", plan.Entries)
 	}
 	assertWindowsACLEntry(t, plan, WindowsACLDenyRead, `C:\workspace\secret-read`, caps.ReadOnly, true)
+	systemDrive := os.Getenv("SystemDrive")
+	if systemDrive == "" {
+		systemDrive = "C:"
+	}
+	systemRoot := os.Getenv("SystemRoot")
+	if systemRoot == "" {
+		systemRoot = systemDrive + `\Windows`
+	}
+	programData := os.Getenv("ProgramData")
+	if programData == "" {
+		programData = systemDrive + `\ProgramData`
+	}
+	assertWindowsACLEntryExt(t, plan, WindowsACLDenyWrite, systemDrive+`\`, caps.ReadOnly, false, false)
+	assertWindowsACLEntryExt(t, plan, WindowsACLDenyWrite, programData, caps.ReadOnly, false, false)
+	assertWindowsACLEntryExt(t, plan, WindowsACLDenyWrite, systemRoot+`\Temp`, caps.ReadOnly, false, false)
 }
 
 func TestBuildWindowsACLPlanRejectsUnrestrictedProfiles(t *testing.T) {
@@ -118,15 +156,21 @@ func TestPlanWindowsDenyReadPathsIncludesCanonicalExistingPath(t *testing.T) {
 
 func assertWindowsACLEntry(t *testing.T, plan WindowsACLPlan, action WindowsACLAction, path string, capability string, materialize bool) {
 	t.Helper()
+	assertWindowsACLEntryExt(t, plan, action, path, capability, materialize, false)
+}
+
+func assertWindowsACLEntryExt(t *testing.T, plan WindowsACLPlan, action WindowsACLAction, path string, capability string, materialize bool, noInherit bool) {
+	t.Helper()
 	for _, entry := range plan.Entries {
 		if entry.Action == action &&
 			windowsCapabilityPathKey(entry.Path) == windowsCapabilityPathKey(path) &&
 			strings.EqualFold(entry.Capability, capability) &&
-			entry.Materialize == materialize {
+			entry.Materialize == materialize &&
+			entry.NoInherit == noInherit {
 			return
 		}
 	}
-	t.Fatalf("ACL entries = %#v, want %s %q capability %q materialize=%v", plan.Entries, action, path, capability, materialize)
+	t.Fatalf("ACL entries = %#v, want %s %q capability %q materialize=%v noInherit=%v", plan.Entries, action, path, capability, materialize, noInherit)
 }
 
 func windowsPathListContains(paths []string, want string) bool {
