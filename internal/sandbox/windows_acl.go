@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -19,6 +20,7 @@ type WindowsACLEntry struct {
 	Path        string           `json:"path"`
 	Capability  string           `json:"capability"`
 	Materialize bool             `json:"materialize,omitempty"`
+	NoInherit   bool             `json:"no_inherit,omitempty"`
 }
 
 type WindowsACLPlan struct {
@@ -76,7 +78,79 @@ func BuildWindowsACLPlan(config WindowsSandboxCommandConfig) (WindowsACLPlan, er
 			})
 		}
 	}
+
+	// Deny write to shared Windows-writable directories (C:\, C:\ProgramData, C:\Windows\Temp)
+	// to prevent write-jail escape via the added Users and Authenticated Users SIDs.
+	systemDrive := os.Getenv("SystemDrive")
+	if systemDrive == "" {
+		systemDrive = "C:"
+	}
+	systemRoot := os.Getenv("SystemRoot")
+	if systemRoot == "" {
+		systemRoot = systemDrive + `\Windows`
+	}
+	programData := os.Getenv("ProgramData")
+	if programData == "" {
+		programData = systemDrive + `\ProgramData`
+	}
+
+	sharedDenyPaths := []string{
+		systemDrive + `\`,
+		programData,
+		systemRoot + `\Temp`,
+	}
+
+	caps, err := LoadOrCreateWindowsCapabilitySIDs(config.SandboxHome)
+	if err != nil {
+		return WindowsACLPlan{}, err
+	}
+	var allSIDs []string
+	for _, cap := range writeCapabilities {
+		allSIDs = append(allSIDs, cap.SID)
+	}
+	allSIDs = append(allSIDs, caps.ReadOnly)
+
+	for _, denyPath := range sharedDenyPaths {
+		isParent := false
+		isEqual := false
+		for _, cap := range writeCapabilities {
+			if isParentOrEqual(denyPath, cap.Root) {
+				if windowsCapabilityPathKey(denyPath) == windowsCapabilityPathKey(cap.Root) {
+					isEqual = true
+				} else {
+					isParent = true
+				}
+			}
+		}
+		if isEqual {
+			continue // Do not deny write if it is exactly an allowed write root
+		}
+		for _, sid := range allSIDs {
+			entries = append(entries, WindowsACLEntry{
+				Action:     WindowsACLDenyWrite,
+				Path:       denyPath,
+				Capability: sid,
+				NoInherit:  isParent, // Disable inheritance if a write root exists inside this path
+			})
+		}
+	}
+
 	return WindowsACLPlan{Entries: dedupeWindowsACLEntries(entries)}, nil
+}
+
+func isParentOrEqual(parent, child string) bool {
+	p := windowsCapabilityPathKey(parent)
+	c := windowsCapabilityPathKey(child)
+	if p == "" || c == "" {
+		return false
+	}
+	if p == c {
+		return true
+	}
+	if !strings.HasSuffix(p, `\`) {
+		p += `\`
+	}
+	return strings.HasPrefix(c, p)
 }
 
 type windowsWriteRootCapability struct {

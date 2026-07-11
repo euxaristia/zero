@@ -193,10 +193,6 @@ func windowsACLGroupRequiresExistingTarget(group windowsACLPathGroup) bool {
 
 func windowsExplicitAccessEntries(entries []WindowsACLEntry, isDir bool) ([]windows.EXPLICIT_ACCESS, error) {
 	out := make([]windows.EXPLICIT_ACCESS, 0, len(entries))
-	inheritance := uint32(0)
-	if isDir {
-		inheritance = windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT
-	}
 	for _, entry := range entries {
 		sid, err := windows.StringToSid(entry.Capability)
 		if err != nil {
@@ -205,6 +201,10 @@ func windowsExplicitAccessEntries(entries []WindowsACLEntry, isDir bool) ([]wind
 		accessMode, permissions, err := windowsACLAccess(entry.Action)
 		if err != nil {
 			return nil, err
+		}
+		inheritance := uint32(0)
+		if isDir && !entry.NoInherit {
+			inheritance = windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT
 		}
 		out = append(out, windows.EXPLICIT_ACCESS{
 			AccessPermissions: permissions,

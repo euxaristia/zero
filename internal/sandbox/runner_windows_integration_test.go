@@ -203,6 +203,22 @@ func TestWindowsUnelevatedRealSandboxSmoke(t *testing.T) {
 	} else if !os.IsNotExist(err) {
 		t.Fatalf("stat outside marker: %v", err)
 	}
+
+	// Verify write to C:\ProgramData is blocked
+	programData := os.Getenv("ProgramData")
+	if programData != "" {
+		programDataMarker := filepath.Join(programData, "zero-unelevated-write-denied.txt")
+		_ = os.Remove(programDataMarker)
+
+		runWindowsRealSmokeCommand(t, runnerExe, config, []string{
+			"cmd.exe", "/d", "/s", "/c", "echo leaked>" + programDataMarker,
+		}, 1)
+
+		if _, err := os.Stat(programDataMarker); err == nil {
+			_ = os.Remove(programDataMarker)
+			t.Fatalf("unelevated sandbox allowed a write to ProgramData shared directory")
+		}
+	}
 }
 
 // TestWindowsRestrictedTokenNestedPipeCapture pins the fix in
