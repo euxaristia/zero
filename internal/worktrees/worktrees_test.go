@@ -414,6 +414,15 @@ func TestCleanSkipsWorktreeWithRecentNestedActivity(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// activePath/internal was created alongside nestedDir by the MkdirAll
+	// above and never backdated, so it would otherwise still carry a fresh
+	// mtime; WalkDir would hit it and report "not stale" before ever reaching
+	// nestedFile, so the test would pass even if the recursive walk stopped
+	// checking after the first directory level.
+	if err := os.Chtimes(filepath.Join(activePath, "internal"), twoDaysAgo, twoDaysAgo); err != nil {
+		t.Fatal(err)
+	}
+
 	runner := &fakeRunner{
 		results: []CommandResult{
 			{Stdout: repoRoot},
