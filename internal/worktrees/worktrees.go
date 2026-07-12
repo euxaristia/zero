@@ -332,6 +332,11 @@ func Clean(ctx context.Context, options Options, maxAge time.Duration) error {
 	if err != nil {
 		return err
 	}
+	// Prepare only ever creates worktrees under this per-repository subtree
+	// (mirroring the repoDir it computes). Scoping pruning to baseDir itself
+	// would authorize deleting a worktree a user manages by hand in the same
+	// directory, which Zero never created and has no business force-removing.
+	repoDir := filepath.Join(baseDir, "zero-worktree-"+repoKey(repoRoot))
 
 	output, err := gitOutput(ctx, runGit, repoRoot, "worktree", "list", "--porcelain")
 	if err != nil {
@@ -347,10 +352,11 @@ func Clean(ctx context.Context, options Options, maxAge time.Duration) error {
 			continue
 		}
 
-		// Only prune worktrees that belong to zero (i.e. inside baseDir), using
-		// a path-boundary-safe comparison so a sibling directory that merely
-		// shares baseDir as a string prefix (e.g. "<baseDir>-other") can't match.
-		if !isUnderDir(entry.path, baseDir) {
+		// Only prune worktrees zero created for this repository (i.e. inside
+		// repoDir), using a path-boundary-safe comparison so a sibling
+		// directory that merely shares repoDir as a string prefix (e.g.
+		// "<repoDir>-other") can't match.
+		if !isUnderDir(entry.path, repoDir) {
 			continue
 		}
 
@@ -366,6 +372,15 @@ func Clean(ctx context.Context, options Options, maxAge time.Duration) error {
 		}
 
 		if worktreeIsStale(entry.path, cutoff) {
+			if worktreeIsDirty(ctx, runGit, entry.path) {
+				// A stale mtime only means nothing changed at the worktree's
+				// top level or below recently; it does not mean the task
+				// holding it is done. Uncommitted or untracked changes are
+				// still live work waiting on a model, network, or user, so
+				// force-removing here would discard it. Skip until it either
+				// gets committed/cleaned (no longer dirty) or unlocked.
+				continue
+			}
 			// gitOutput (not a raw runGit call) so a nonzero exit code is
 			// reported as a failure: defaultRunGit deliberately returns a nil
 			// error alongside a nonzero CommandResult.ExitCode for a failed git
@@ -455,4 +470,21 @@ func worktreeIsStale(root string, cutoff time.Time) bool {
 		return nil
 	})
 	return stale && walkErr == nil
+}
+
+// worktreeIsDirty reports whether a worktree has uncommitted or untracked
+// changes, via `git status --porcelain` run inside it. A task can hold a
+// worktree with live, unpushed work while it waits on a model, network, or
+// user for far longer than the staleness window, without writing to the tree
+// again in that time; mtime alone can't distinguish that from an abandoned
+// one, but a dirty working tree still can.
+//
+// An inspection failure fails closed, treating it as dirty rather than clean:
+// an incomplete check must not authorize a forced removal.
+func worktreeIsDirty(ctx context.Context, runGit GitRunner, path string) bool {
+	output, err := gitOutput(ctx, runGit, path, "status", "--porcelain")
+	if err != nil {
+		return true
+	}
+	return output != ""
 }

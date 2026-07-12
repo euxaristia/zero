@@ -102,11 +102,12 @@ func TestRedactNoMatchReturnsInputUnchanged(t *testing.T) {
 }
 
 func TestScanDetectsModernPrefixedOpenAIKeys(t *testing.T) {
-	// Modern keys carry sk-proj-/sk-svcacct- prefixes and use - and _ in the body;
-	// the legacy sk-<alnum> pattern would have missed them.
+	// Modern keys carry sk-proj-/sk-svcacct-/sk-admin- prefixes and use - and _ in
+	// the body; the legacy sk-<alnum> pattern would have missed them.
 	for _, key := range []string{
 		"sk-proj-abcDEF123_ghiJKL456-mnoPQR789stu",
 		"sk-svcacct-abcDEF123_ghiJKL456-mnoPQR789",
+		"sk-admin-abcDEF123_ghiJKL456-mnoPQR789stu",
 	} {
 		redacted, findings := Redact("token=" + key)
 		if len(findings) != 1 || findings[0].Type != "openai_key" {
@@ -171,6 +172,41 @@ func TestScanRedactsTrailingHyphenWithoutTailLeak(t *testing.T) {
 		wantRedacted := "secret is [REDACTED:" + tc.wantType + "] end"
 		if redacted != wantRedacted {
 			t.Errorf("%s: redacted = %q, want %q", tc.wantType, redacted, wantRedacted)
+		}
+	}
+}
+
+// A credential with more word characters appended right after its body (a
+// copy-paste artifact, an env-var-style suffix) must still have its real
+// secret material redacted, even though the appended run itself is outside
+// the body class and so is left un-redacted. A trailing \b anchor would find
+// no word/non-word transition there and, for a fixed or unbounded-greedy
+// quantifier, fail the whole match instead of backtracking, leaking the
+// credential entirely.
+func TestScanRedactsCredentialWithAppendedSuffix(t *testing.T) {
+	cases := []struct {
+		wantType string
+		secret   string
+		suffix   string
+	}{
+		{"aws_access_key_id", "AKIAIOSFODNN7EXAMPLE", "EXTRA"},
+		{"github_token", "ghp_1234567890abcdefghijklmnopqrstuvwxyz", "_suffix"},
+	}
+	for _, tc := range cases {
+		text := "token=" + tc.secret + tc.suffix + " end"
+		redacted, findings := Redact(text)
+		if len(findings) != 1 || findings[0].Type != tc.wantType {
+			t.Fatalf("%s: expected one finding for %q, got %#v", tc.wantType, tc.secret+tc.suffix, findings)
+		}
+		if findings[0].Match != tc.secret {
+			t.Fatalf("%s: matched %q, want the credential prefix %q", tc.wantType, findings[0].Match, tc.secret)
+		}
+		if strings.Contains(redacted, tc.secret) {
+			t.Fatalf("%s: credential leaked after redaction: %q", tc.wantType, redacted)
+		}
+		wantRedacted := "token=[REDACTED:" + tc.wantType + "]" + tc.suffix + " end"
+		if redacted != wantRedacted {
+			t.Fatalf("%s: redacted = %q, want %q", tc.wantType, redacted, wantRedacted)
 		}
 	}
 }

@@ -253,10 +253,11 @@ func TestCleanPrunesStaleWorktrees(t *testing.T) {
 	tempDir := t.TempDir()
 	baseDir := filepath.Join(tempDir, "zero-worktrees")
 	repoRoot := filepath.Join(tempDir, "repo")
+	repoDir := filepath.Join(baseDir, "zero-worktree-"+repoKey(repoRoot))
 
 	// Create directories representing two worktrees: one young, one stale.
-	youngPath := filepath.Join(baseDir, "young-task")
-	stalePath := filepath.Join(baseDir, "stale-task")
+	youngPath := filepath.Join(repoDir, "young-task")
+	stalePath := filepath.Join(repoDir, "stale-task")
 	if err := os.MkdirAll(youngPath, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -277,6 +278,7 @@ func TestCleanPrunesStaleWorktrees(t *testing.T) {
 		results: []CommandResult{
 			{Stdout: repoRoot}, // rev-parse --show-toplevel
 			{Stdout: "worktree " + youngPath + "\nworktree " + stalePath + "\n"}, // worktree list --porcelain
+			{ExitCode: 0}, // status --porcelain <stalePath> (clean)
 			{ExitCode: 0}, // worktree remove --force <stalePath>
 			{ExitCode: 0}, // worktree prune
 		},
@@ -294,8 +296,8 @@ func TestCleanPrunesStaleWorktrees(t *testing.T) {
 	}
 
 	// Verify the calls made by Clean
-	if len(runner.calls) != 4 {
-		t.Fatalf("expected 4 git calls, got %d", len(runner.calls))
+	if len(runner.calls) != 5 {
+		t.Fatalf("expected 5 git calls, got %d", len(runner.calls))
 	}
 	if runner.commandLine(0) != "git rev-parse --show-toplevel" {
 		t.Errorf("call 0 = %q", runner.commandLine(0))
@@ -303,12 +305,16 @@ func TestCleanPrunesStaleWorktrees(t *testing.T) {
 	if runner.commandLine(1) != "git worktree list --porcelain" {
 		t.Errorf("call 1 = %q", runner.commandLine(1))
 	}
-	expectedRemoveCall := "git worktree remove --force " + filepath.Clean(stalePath)
-	if runner.commandLine(2) != expectedRemoveCall {
-		t.Errorf("call 2 = %q, want %q", runner.commandLine(2), expectedRemoveCall)
+	expectedStatusCall := "git status --porcelain"
+	if runner.commandLine(2) != expectedStatusCall {
+		t.Errorf("call 2 = %q, want %q", runner.commandLine(2), expectedStatusCall)
 	}
-	if runner.commandLine(3) != "git worktree prune" {
-		t.Errorf("call 3 = %q", runner.commandLine(3))
+	expectedRemoveCall := "git worktree remove --force " + filepath.Clean(stalePath)
+	if runner.commandLine(3) != expectedRemoveCall {
+		t.Errorf("call 3 = %q, want %q", runner.commandLine(3), expectedRemoveCall)
+	}
+	if runner.commandLine(4) != "git worktree prune" {
+		t.Errorf("call 4 = %q", runner.commandLine(4))
 	}
 }
 
@@ -320,8 +326,9 @@ func TestCleanReportsErrorOnFailedRemoval(t *testing.T) {
 	tempDir := t.TempDir()
 	baseDir := filepath.Join(tempDir, "zero-worktrees")
 	repoRoot := filepath.Join(tempDir, "repo")
+	repoDir := filepath.Join(baseDir, "zero-worktree-"+repoKey(repoRoot))
 
-	stalePath := filepath.Join(baseDir, "stale-task")
+	stalePath := filepath.Join(repoDir, "stale-task")
 	if err := os.MkdirAll(stalePath, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -337,6 +344,7 @@ func TestCleanReportsErrorOnFailedRemoval(t *testing.T) {
 		results: []CommandResult{
 			{Stdout: repoRoot},
 			{Stdout: "worktree " + stalePath + "\n"},
+			{ExitCode: 0}, // status --porcelain <stalePath> (clean)
 			{ExitCode: 1, Stderr: "fatal: unable to remove worktree: in use"},
 			{ExitCode: 0},
 		},
@@ -380,8 +388,9 @@ func TestCleanSkipsWorktreeWithRecentNestedActivity(t *testing.T) {
 	tempDir := t.TempDir()
 	baseDir := filepath.Join(tempDir, "zero-worktrees")
 	repoRoot := filepath.Join(tempDir, "repo")
+	repoDir := filepath.Join(baseDir, "zero-worktree-"+repoKey(repoRoot))
 
-	activePath := filepath.Join(baseDir, "active-task")
+	activePath := filepath.Join(repoDir, "active-task")
 	nestedDir := filepath.Join(activePath, "internal", "pkg")
 	if err := os.MkdirAll(nestedDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -462,13 +471,17 @@ func TestCleanSkipsLockedWorktree(t *testing.T) {
 	}
 }
 
-// A sibling directory that merely shares baseDir as a string prefix (e.g.
-// "<baseDir>-other") must not be treated as zero-owned.
+// A sibling directory that merely shares the per-repository repoDir as a
+// string prefix (e.g. "<repoDir>-other") must not be treated as zero-owned.
+// This also covers a manually managed worktree for the SAME repository that a
+// user placed directly under a shared baseDir rather than inside zero's
+// repoDir subtree: it must not be treated as zero-owned either.
 func TestCleanRejectsSiblingDirWithSharedPrefix(t *testing.T) {
 	tempDir := t.TempDir()
 	baseDir := filepath.Join(tempDir, "zero-worktrees")
-	siblingDir := baseDir + "-other"
 	repoRoot := filepath.Join(tempDir, "repo")
+	repoDir := filepath.Join(baseDir, "zero-worktree-"+repoKey(repoRoot))
+	siblingDir := repoDir + "-other"
 
 	siblingPath := filepath.Join(siblingDir, "not-ours")
 	if err := os.MkdirAll(siblingPath, 0o755); err != nil {
@@ -498,6 +511,97 @@ func TestCleanRejectsSiblingDirWithSharedPrefix(t *testing.T) {
 		if len(call.args) > 0 && call.args[0] == "remove" {
 			t.Fatalf("Clean removed a sibling directory outside baseDir: %v", call.args)
 		}
+	}
+}
+
+// A manually managed worktree that a user placed directly under a shared
+// baseDir, outside zero's own "zero-worktree-<repoKey>" subtree, must never
+// be pruned even though it is technically inside baseDir.
+func TestCleanIgnoresWorktreeOutsideOwnedSubtree(t *testing.T) {
+	tempDir := t.TempDir()
+	baseDir := filepath.Join(tempDir, "zero-worktrees")
+	repoRoot := filepath.Join(tempDir, "repo")
+
+	manualPath := filepath.Join(baseDir, "hand-managed-checkout")
+	if err := os.MkdirAll(manualPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(repoRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	twoDaysAgo := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(manualPath, twoDaysAgo, twoDaysAgo); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &fakeRunner{
+		results: []CommandResult{
+			{Stdout: repoRoot},
+			{Stdout: "worktree " + manualPath + "\n"},
+			{ExitCode: 0}, // worktree prune
+		},
+	}
+
+	if err := Clean(context.Background(), Options{Cwd: repoRoot, BaseDir: baseDir, RunGit: runner.Run}, 24*time.Hour); err != nil {
+		t.Fatalf("Clean failed: %v", err)
+	}
+
+	for _, call := range runner.calls {
+		if len(call.args) > 0 && (call.args[0] == "remove" || call.args[0] == "status") {
+			t.Fatalf("Clean touched a worktree outside its owned subtree: %v", call.args)
+		}
+	}
+}
+
+// A worktree with a stale top-level mtime but uncommitted or untracked
+// changes must not be force-removed: a task can hold live work in a worktree
+// while waiting on a model, network, or user for far longer than the
+// staleness window, without ever writing to the tree again in that time.
+func TestCleanSkipsDirtyStaleWorktree(t *testing.T) {
+	tempDir := t.TempDir()
+	baseDir := filepath.Join(tempDir, "zero-worktrees")
+	repoRoot := filepath.Join(tempDir, "repo")
+	repoDir := filepath.Join(baseDir, "zero-worktree-"+repoKey(repoRoot))
+
+	dirtyPath := filepath.Join(repoDir, "dirty-task")
+	if err := os.MkdirAll(dirtyPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(repoRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	twoDaysAgo := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(dirtyPath, twoDaysAgo, twoDaysAgo); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &fakeRunner{
+		results: []CommandResult{
+			{Stdout: repoRoot},
+			{Stdout: "worktree " + dirtyPath + "\n"},
+			{Stdout: " M internal/pkg/handler.go\n"}, // status --porcelain: dirty
+			{ExitCode: 0},                            // worktree prune
+		},
+	}
+
+	if err := Clean(context.Background(), Options{Cwd: repoRoot, BaseDir: baseDir, RunGit: runner.Run}, 24*time.Hour); err != nil {
+		t.Fatalf("Clean failed: %v", err)
+	}
+
+	for _, call := range runner.calls {
+		if len(call.args) > 0 && call.args[0] == "remove" {
+			t.Fatalf("Clean removed a dirty worktree: %v", call.args)
+		}
+	}
+}
+
+// An inspection failure (git status errors out) must fail closed: treat the
+// worktree as dirty rather than clean, so a broken status check can never
+// authorize a forced removal.
+func TestWorktreeIsDirtyFailsClosedOnInspectionError(t *testing.T) {
+	runner := &fakeRunner{results: []CommandResult{{ExitCode: 1, Stderr: "fatal: not a git repository"}}}
+	if !worktreeIsDirty(context.Background(), runner.Run, t.TempDir()) {
+		t.Fatal("expected worktreeIsDirty to fail closed on a status error")
 	}
 }
 
