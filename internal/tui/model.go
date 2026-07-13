@@ -24,6 +24,7 @@ import (
 	internalmcp "github.com/Gitlawb/zero/internal/mcp"
 	"github.com/Gitlawb/zero/internal/modelregistry"
 	"github.com/Gitlawb/zero/internal/notify"
+	"github.com/Gitlawb/zero/internal/planmode"
 	"github.com/Gitlawb/zero/internal/providerhealth"
 	"github.com/Gitlawb/zero/internal/providermodeldiscovery"
 	"github.com/Gitlawb/zero/internal/providers/providerio"
@@ -126,6 +127,9 @@ type model struct {
 	agentOptions                agent.Options
 	notifier                    *notify.Notifier
 	permissionMode              agent.PermissionMode
+	// permissionModeBeforePlan is the mode active before /plan entered plan
+	// mode, restored on /plan off instead of hardcoding Auto.
+	permissionModeBeforePlan agent.PermissionMode
 	// program is the live Bubble Tea program, set right before Run so /plan open
 	// can suspend the TUI, launch $EDITOR, and resume on exit.
 	program          *tea.Program
@@ -5113,8 +5117,15 @@ func (m model) runAgentWithOptions(runID int, runCtx context.Context, prompt str
 		if runOptions.permissionMode != "" {
 			options.PermissionMode = runOptions.permissionMode
 		}
-		if runOptions.systemPrompt != "" {
+		switch {
+		case runOptions.systemPrompt != "":
 			options.SystemPrompt = runOptions.systemPrompt
+		case options.PermissionMode == agent.PermissionModePlan:
+			// Plan mode is toggled via /plan on the normal submit path (not a
+			// dedicated run-launch command like /spec), so there is no call site
+			// to pass planmode.DraftSystemPrompt through runOptions: set it here
+			// from the active permission mode instead.
+			options.SystemPrompt = planmode.DraftSystemPrompt
 		}
 		if goalAwareRun {
 			options.SystemPrompt = m.goalSystemPrompt(options.SystemPrompt)
