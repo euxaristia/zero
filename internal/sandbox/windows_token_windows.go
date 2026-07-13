@@ -48,7 +48,7 @@ func (sid windowsLocalSID) close() {
 	}
 }
 
-func createWindowsRestrictedTokenForCapabilitySIDs(capabilitySIDStrings []string, writeRestricted bool) (windows.Token, error) {
+func createWindowsRestrictedTokenForCapabilitySIDs(capabilitySIDStrings []string, writeRestricted, broadenReadSIDs bool) (windows.Token, error) {
 	if len(capabilitySIDStrings) == 0 {
 		return 0, errors.New("windows restricted token requires at least one capability SID")
 	}
@@ -80,10 +80,23 @@ func createWindowsRestrictedTokenForCapabilitySIDs(capabilitySIDStrings []string
 		return 0, fmt.Errorf("open process token: %w", err)
 	}
 	defer base.Close()
-	return createWindowsRestrictedTokenFromBase(base, capabilitySIDs, writeRestricted)
+	return createWindowsRestrictedTokenFromBase(base, capabilitySIDs, writeRestricted, broadenReadSIDs)
 }
 
-func createWindowsRestrictedTokenFromBase(base windows.Token, capabilitySIDs []windowsLocalSID, writeRestricted bool) (windows.Token, error) {
+// createWindowsRestrictedTokenFromBase builds the restricted token. When
+// broadenReadSIDs is set, it also restricts to WinBuiltinUsersSid and
+// WinAuthenticatedUserSid so the sandboxed process can read/execute binaries
+// under paths like C:\Program Files or C:\Windows whose ACLs grant
+// Users/Authenticated Users rather than Everyone. Because the restricting-SID
+// check applies to writes as well as reads, this also grants write wherever
+// those groups already have it — BuildWindowsACLPlan mitigates that by adding
+// DenyWrite ACEs to the known shared Users/Authenticated-Users-writable
+// directories, but it can only do so with Administrator rights (see
+// WindowsSandboxLevelRestrictedToken). broadenReadSIDs must therefore stay
+// false for WindowsSandboxLevelUnelevated, which cannot enforce that
+// mitigation: it keeps the original (narrower) read scope instead of
+// widening the write jail with nothing to close the gap.
+func createWindowsRestrictedTokenFromBase(base windows.Token, capabilitySIDs []windowsLocalSID, writeRestricted, broadenReadSIDs bool) (windows.Token, error) {
 	logonSID, err := copyWindowsLogonSID(base)
 	if err != nil {
 		return 0, err
@@ -91,14 +104,6 @@ func createWindowsRestrictedTokenFromBase(base windows.Token, capabilitySIDs []w
 	worldSID, err := windows.CreateWellKnownSid(windows.WinWorldSid)
 	if err != nil {
 		return 0, fmt.Errorf("create world SID: %w", err)
-	}
-	usersSID, err := windows.CreateWellKnownSid(windows.WinBuiltinUsersSid)
-	if err != nil {
-		return 0, fmt.Errorf("create users SID: %w", err)
-	}
-	authUserSID, err := windows.CreateWellKnownSid(windows.WinAuthenticatedUserSid)
-	if err != nil {
-		return 0, fmt.Errorf("create authenticated user SID: %w", err)
 	}
 
 	entries := make([]windows.SIDAndAttributes, 0, len(capabilitySIDs)+4)
@@ -108,9 +113,21 @@ func createWindowsRestrictedTokenFromBase(base windows.Token, capabilitySIDs []w
 	entries = append(entries,
 		windows.SIDAndAttributes{Sid: sidFromBytes(logonSID)},
 		windows.SIDAndAttributes{Sid: worldSID},
-		windows.SIDAndAttributes{Sid: usersSID},
-		windows.SIDAndAttributes{Sid: authUserSID},
 	)
+	if broadenReadSIDs {
+		usersSID, err := windows.CreateWellKnownSid(windows.WinBuiltinUsersSid)
+		if err != nil {
+			return 0, fmt.Errorf("create users SID: %w", err)
+		}
+		authUserSID, err := windows.CreateWellKnownSid(windows.WinAuthenticatedUserSid)
+		if err != nil {
+			return 0, fmt.Errorf("create authenticated user SID: %w", err)
+		}
+		entries = append(entries,
+			windows.SIDAndAttributes{Sid: usersSID},
+			windows.SIDAndAttributes{Sid: authUserSID},
+		)
+	}
 
 	// WRITE_RESTRICTED scopes the restricted-SID check to write-type accesses:
 	// reads use only the normal token identity, so the sandboxed process can

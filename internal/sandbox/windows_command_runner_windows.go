@@ -75,7 +75,11 @@ func runWindowsSandboxCommand(config WindowsSandboxCommandConfig, stderr io.Writ
 	// reads under that flag (#612). Profiles with DenyRead keep the fully
 	// restricted token, trading spawn capability for read-deny enforcement.
 	writeRestricted := len(config.PermissionProfile.FileSystem.DenyRead) == 0
-	token, err := createWindowsRestrictedTokenForCapabilitySIDs(tokenSIDs, writeRestricted)
+	// Only the elevated restricted-token tier can enforce the DenyWrite
+	// mitigation BuildWindowsACLPlan adds for the broadened read SIDs (it
+	// requires Administrator rights); see createWindowsRestrictedTokenFromBase.
+	broadenReadSIDs := config.SandboxLevel == WindowsSandboxLevelRestrictedToken
+	token, err := createWindowsRestrictedTokenForCapabilitySIDs(tokenSIDs, writeRestricted, broadenReadSIDs)
 	if err != nil {
 		fmt.Fprintln(stderr, WindowsSandboxCommandRunnerName+": "+err.Error())
 		return 1

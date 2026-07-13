@@ -20,7 +20,6 @@ type WindowsACLEntry struct {
 	Path        string           `json:"path"`
 	Capability  string           `json:"capability"`
 	Materialize bool             `json:"materialize,omitempty"`
-	NoInherit   bool             `json:"no_inherit,omitempty"`
 }
 
 type WindowsACLPlan struct {
@@ -79,78 +78,88 @@ func BuildWindowsACLPlan(config WindowsSandboxCommandConfig) (WindowsACLPlan, er
 		}
 	}
 
-	// Deny write to shared Windows-writable directories (C:\, C:\ProgramData, C:\Windows\Temp)
-	// to prevent write-jail escape via the added Users and Authenticated Users SIDs.
-	systemDrive := os.Getenv("SystemDrive")
-	if systemDrive == "" {
-		systemDrive = "C:"
-	}
-	systemRoot := os.Getenv("SystemRoot")
-	if systemRoot == "" {
-		systemRoot = systemDrive + `\Windows`
-	}
-	programData := os.Getenv("ProgramData")
-	if programData == "" {
-		programData = systemDrive + `\ProgramData`
-	}
+	// Deny write to shared Windows-writable directories (C:\, C:\ProgramData,
+	// C:\Windows\Temp, C:\Users\Public) to prevent write-jail escape via the
+	// added Users and Authenticated Users SIDs. Only the elevated tier
+	// (WindowsSandboxLevelRestrictedToken, applied by `zero sandbox setup`
+	// running as Administrator) reaches here with those SIDs on the token in
+	// the first place — see createWindowsRestrictedTokenFromBase — and only
+	// that tier has the WRITE_DAC needed to edit these system-owned DACLs.
+	// The unelevated tier keeps the narrower (pre-widening) restricting-SID
+	// set and never needs these entries.
+	if config.SandboxLevel == WindowsSandboxLevelRestrictedToken {
+		systemDrive := os.Getenv("SystemDrive")
+		if systemDrive == "" {
+			systemDrive = "C:"
+		}
+		systemRoot := os.Getenv("SystemRoot")
+		if systemRoot == "" {
+			systemRoot = systemDrive + `\Windows`
+		}
+		programData := os.Getenv("ProgramData")
+		if programData == "" {
+			programData = systemDrive + `\ProgramData`
+		}
+		publicDir := os.Getenv("PUBLIC")
+		if publicDir == "" {
+			publicDir = systemDrive + `\Users\Public`
+		}
 
-	sharedDenyPaths := []string{
-		systemDrive + `\`,
-		programData,
-		systemRoot + `\Temp`,
-	}
+		sharedDenyPaths := []string{
+			systemDrive + `\`,
+			programData,
+			systemRoot + `\Temp`,
+			publicDir,
+		}
 
-	caps, err := LoadOrCreateWindowsCapabilitySIDs(config.SandboxHome)
-	if err != nil {
-		return WindowsACLPlan{}, err
-	}
-	var allSIDs []string
-	for _, cap := range writeCapabilities {
-		allSIDs = append(allSIDs, cap.SID)
-	}
-	allSIDs = append(allSIDs, caps.ReadOnly)
-
-	for _, denyPath := range sharedDenyPaths {
-		isParent := false
-		isEqual := false
+		caps, err := LoadOrCreateWindowsCapabilitySIDs(config.SandboxHome)
+		if err != nil {
+			return WindowsACLPlan{}, err
+		}
+		var allSIDs []string
 		for _, cap := range writeCapabilities {
-			if isParentOrEqual(denyPath, cap.Root) {
-				if windowsCapabilityPathKey(denyPath) == windowsCapabilityPathKey(cap.Root) {
-					isEqual = true
-				} else {
-					isParent = true
-				}
+			allSIDs = append(allSIDs, cap.SID)
+		}
+		allSIDs = append(allSIDs, caps.ReadOnly)
+
+		for _, denyPath := range sharedDenyPaths {
+			if windowsPathEqualsAnyRoot(denyPath, writeCapabilities) {
+				continue // Do not deny write if it is exactly an allowed write root
 			}
-		}
-		if isEqual {
-			continue // Do not deny write if it is exactly an allowed write root
-		}
-		for _, sid := range allSIDs {
-			entries = append(entries, WindowsACLEntry{
-				Action:     WindowsACLDenyWrite,
-				Path:       denyPath,
-				Capability: sid,
-				NoInherit:  isParent, // Disable inheritance if a write root exists inside this path
-			})
+			// Inheritance is intentionally left on: the write root's own
+			// explicit Allow ACE (set directly on that path in its own group,
+			// above) is a non-inherited entry, and canonical ACE ordering
+			// always evaluates explicit entries before inherited ones — so an
+			// inherited Deny from a shared ancestor here can never shadow it.
+			// It also still defends newly created objects elsewhere under the
+			// shared path: NTFS does not retroactively propagate an
+			// inheritable ACE onto pre-existing children, which is exactly
+			// why C:\Users\Public above is listed explicitly rather than
+			// relied on via inheritance from C:\.
+			for _, sid := range allSIDs {
+				entries = append(entries, WindowsACLEntry{
+					Action:     WindowsACLDenyWrite,
+					Path:       denyPath,
+					Capability: sid,
+				})
+			}
 		}
 	}
 
 	return WindowsACLPlan{Entries: dedupeWindowsACLEntries(entries)}, nil
 }
 
-func isParentOrEqual(parent, child string) bool {
-	p := windowsCapabilityPathKey(parent)
-	c := windowsCapabilityPathKey(child)
-	if p == "" || c == "" {
+func windowsPathEqualsAnyRoot(path string, capabilities []windowsWriteRootCapability) bool {
+	key := windowsCapabilityPathKey(path)
+	if key == "" {
 		return false
 	}
-	if p == c {
-		return true
+	for _, cap := range capabilities {
+		if windowsCapabilityPathKey(cap.Root) == key {
+			return true
+		}
 	}
-	if !strings.HasSuffix(p, `\`) {
-		p += `\`
-	}
-	return strings.HasPrefix(c, p)
+	return false
 }
 
 type windowsWriteRootCapability struct {
