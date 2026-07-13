@@ -72,6 +72,29 @@ func TestWindowsRestrictedTokenRealSandboxSmoke(t *testing.T) {
 		t.Fatalf("sandboxed write marker = %q, %v; want ok", bytes, err)
 	}
 
+	// The elevated tier's restricted token carries the Users/Authenticated
+	// Users SIDs (added for Program Files/System32 reads), which also match
+	// the write grant those groups already hold on C:\Users\Public. Pin that
+	// BuildWindowsACLPlan's DenyWrite mitigation still blocks a write there:
+	// an independent shared-writable directory outside every carved-out
+	// system path (ProgramData, Windows\Temp), and outside every workspace
+	// write root.
+	publicDir := os.Getenv("PUBLIC")
+	if publicDir == "" {
+		t.Skip("PUBLIC is not set; cannot probe C:\\Users\\Public write jail")
+	}
+	publicMarker := filepath.Join(publicDir, "zero-elevated-write-denied.txt")
+	_ = os.Remove(publicMarker)
+	runWindowsRealSmokeCommand(t, runnerExe, config, []string{
+		"cmd.exe", "/d", "/s", "/c", "echo leaked>" + publicMarker,
+	}, 1)
+	if _, err := os.Stat(publicMarker); err == nil {
+		_ = os.Remove(publicMarker)
+		t.Fatalf("Windows sandbox allowed a write to the shared C:\\Users\\Public directory")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat public marker: %v", err)
+	}
+
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen loopback for Windows network smoke: %v", err)
