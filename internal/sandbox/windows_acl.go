@@ -2,7 +2,7 @@ package sandbox
 
 import (
 	"errors"
-	"os"
+	"fmt"
 	"path/filepath"
 	"strings"
 )
@@ -16,10 +16,18 @@ const (
 )
 
 type WindowsACLEntry struct {
-	Action      WindowsACLAction `json:"action"`
-	Path        string           `json:"path"`
-	Capability  string           `json:"capability"`
-	Materialize bool             `json:"materialize,omitempty"`
+	Action     WindowsACLAction `json:"action"`
+	Path       string           `json:"path"`
+	Capability string           `json:"capability"`
+	// NoInherit forces the applied ACE to carry no inheritance flags, even
+	// when the target is a directory. Without it, applyWindowsACLPlan makes
+	// every directory ACE inheritable (SUB_CONTAINERS_AND_OBJECTS_INHERIT),
+	// and SetNamedSecurityInfo automatically propagates any inheritable ACE
+	// down onto the target's EXISTING descendants (not just new ones it
+	// creates going forward) — see the shared-deny-path entries below for
+	// why that is unsafe on broad system roots.
+	NoInherit   bool `json:"noInherit,omitempty"`
+	Materialize bool `json:"materialize,omitempty"`
 }
 
 type WindowsACLPlan struct {
@@ -88,21 +96,13 @@ func BuildWindowsACLPlan(config WindowsSandboxCommandConfig) (WindowsACLPlan, er
 	// The unelevated tier keeps the narrower (pre-widening) restricting-SID
 	// set and never needs these entries.
 	if config.SandboxLevel == WindowsSandboxLevelRestrictedToken {
-		systemDrive := os.Getenv("SystemDrive")
-		if systemDrive == "" {
-			systemDrive = "C:"
-		}
-		systemRoot := os.Getenv("SystemRoot")
-		if systemRoot == "" {
-			systemRoot = systemDrive + `\Windows`
-		}
-		programData := os.Getenv("ProgramData")
-		if programData == "" {
-			programData = systemDrive + `\ProgramData`
-		}
-		publicDir := os.Getenv("PUBLIC")
-		if publicDir == "" {
-			publicDir = systemDrive + `\Users\Public`
+		// Resolved from trusted Win32 APIs, not from the
+		// SystemDrive/SystemRoot/ProgramData/PUBLIC environment variables:
+		// see resolveWindowsSharedDenyPaths for why trusting the environment
+		// here would be a spoofable security boundary.
+		systemDrive, systemRoot, programData, publicDir, err := resolveWindowsSharedDenyPaths()
+		if err != nil {
+			return WindowsACLPlan{}, fmt.Errorf("resolve shared deny paths: %w", err)
 		}
 
 		sharedDenyPaths := []string{
@@ -126,21 +126,28 @@ func BuildWindowsACLPlan(config WindowsSandboxCommandConfig) (WindowsACLPlan, er
 			if windowsPathEqualsAnyRoot(denyPath, writeCapabilities) {
 				continue // Do not deny write if it is exactly an allowed write root
 			}
-			// Inheritance is intentionally left on: the write root's own
-			// explicit Allow ACE (set directly on that path in its own group,
-			// above) is a non-inherited entry, and canonical ACE ordering
-			// always evaluates explicit entries before inherited ones — so an
-			// inherited Deny from a shared ancestor here can never shadow it.
-			// It also still defends newly created objects elsewhere under the
-			// shared path: NTFS does not retroactively propagate an
-			// inheritable ACE onto pre-existing children, which is exactly
-			// why C:\Users\Public above is listed explicitly rather than
-			// relied on via inheritance from C:\.
+			// NoInherit: these four shared paths must NOT carry an inheritable
+			// ACE. SetNamedSecurityInfo automatically propagates any
+			// inheritable ACE down onto the target's EXISTING descendants
+			// (per Microsoft's documented remarks for SetNamedSecurityInfoW),
+			// not just ones created afterward. C:\ in particular can have an
+			// enormous, slow-to-walk, and largely unrelated existing subtree
+			// (Program Files, Users, arbitrary installed software), and
+			// stamping a synthetic deny ACE onto all of it would also
+			// permanently pollute those machine ACLs and could shadow
+			// legitimate workspace Allow entries for repos that happen to
+			// live under the system drive. Each of these four paths is
+			// listed explicitly (rather than relied on via inheritance from
+			// C:\) precisely so a plain, non-inherited Deny placed directly
+			// on each one is sufficient: it blocks the denied SIDs from
+			// writing (including creating new children) directly under that
+			// path without ever touching any descendant's own ACL.
 			for _, sid := range allSIDs {
 				entries = append(entries, WindowsACLEntry{
 					Action:     WindowsACLDenyWrite,
 					Path:       denyPath,
 					Capability: sid,
+					NoInherit:  true,
 				})
 			}
 		}
