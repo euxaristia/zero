@@ -203,7 +203,7 @@ func windowsExplicitAccessEntries(entries []WindowsACLEntry, isDir bool) ([]wind
 			return nil, err
 		}
 		inheritance := uint32(0)
-		if isDir {
+		if isDir && !entry.NoInherit {
 			inheritance = windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT
 		}
 		out = append(out, windows.EXPLICIT_ACCESS{
