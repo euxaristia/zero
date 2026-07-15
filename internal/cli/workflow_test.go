@@ -272,6 +272,32 @@ func TestRunWorktreesReleaseWiresWorkspaceCwd(t *testing.T) {
 	}
 }
 
+func TestRunWorktreesReleaseHonorsExplicitCwd(t *testing.T) {
+	// The deleted-path recovery cannot derive the source repository from the
+	// worktree path (the directory is gone and its name is a one-way hash),
+	// so -C names it explicitly; the resolved root must reach Release as
+	// Options.Cwd regardless of where the command was launched.
+	launchDir := t.TempDir()
+	repoDir := t.TempDir()
+	var gotCwd string
+
+	var stdout, stderr bytes.Buffer
+	exitCode := runWithDeps([]string{"worktrees", "release", "-C", repoDir, filepath.Join(repoDir, "already-deleted")}, &stdout, &stderr, appDeps{
+		getwd: func() (string, error) { return launchDir, nil },
+		releaseWorktree: func(ctx context.Context, options worktrees.Options, path string) error {
+			gotCwd = options.Cwd
+			return nil
+		},
+	})
+
+	if exitCode != exitSuccess {
+		t.Fatalf("expected exit code %d, got %d: %s", exitSuccess, exitCode, stderr.String())
+	}
+	if gotCwd != repoDir {
+		t.Fatalf("release Options.Cwd = %q, want explicit -C root %q", gotCwd, repoDir)
+	}
+}
+
 func TestRunWorktreesReleaseReportsErrors(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -800,11 +826,11 @@ func TestRunExecWorktreeReleasesLockAfterRun(t *testing.T) {
 }
 
 func TestRunExecWorktreeKeepsLockItDidNotAcquire(t *testing.T) {
-	// Prepare reports LockAcquired=false when it reused a worktree whose lock
-	// an external `zero worktrees prepare` caller still holds. Releasing that
-	// lock here would clear the external caller's lease and let a later Clean
-	// force-delete a workspace that caller is still using, so exec must only
-	// release the ownership its own invocation established.
+	// Defense in depth: Prepare now rejects an in-use lease outright, so a
+	// successful result always reports LockAcquired=true. Should that ever
+	// change, exec must still only release the ownership its own invocation
+	// established; releasing a lock it did not acquire would clear another
+	// caller's lease and let a later Clean force-delete a live workspace.
 	root := t.TempDir()
 	worktreeDir := t.TempDir()
 	releaseCalls := 0

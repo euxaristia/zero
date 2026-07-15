@@ -50,11 +50,6 @@ type Result struct {
 var worktreeNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$`)
 
 func Prepare(ctx context.Context, options Options) (Result, error) {
-	// Clean up stale worktrees (older than 24 hours) automatically to prevent disk space leaks.
-	if options.RunGit == nil {
-		_ = Clean(ctx, options, 24*time.Hour)
-	}
-
 	cwd, err := resolveCwd(options.Cwd)
 	if err != nil {
 		return Result{}, err
@@ -73,6 +68,14 @@ func Prepare(ctx context.Context, options Options) (Result, error) {
 	}
 	if err := validateName(name); err != nil {
 		return Result{}, err
+	}
+
+	// Clean up stale worktrees (older than 24 hours) automatically to prevent
+	// disk space leaks. Only after the request itself validated: a rejected
+	// command (for example an invalid --name) must not have destructive
+	// cleanup side effects before reporting its error.
+	if options.RunGit == nil {
+		_ = Clean(ctx, options, 24*time.Hour)
 	}
 
 	repoRoot, err := gitOutput(ctx, runGit, cwd, "rev-parse", "--show-toplevel")
@@ -120,14 +123,19 @@ func Prepare(ctx context.Context, options Options) (Result, error) {
 		// A reused worktree may have been released by a prior run's exit, and
 		// an unlocked target is exposed to Clean's staleness heuristic while
 		// this caller is still using it, so re-establish the lease here. A
-		// lock already held (an external prepare caller is still using the
-		// path) stays in place and is reported via LockAcquired=false so this
-		// caller knows the release duty is not its own.
+		// lock already held means another run is still using the path: two
+		// live runs must not share one supposedly isolated checkout (they
+		// would edit the same tree, and whichever exits first would release
+		// the single Git lock out from under the other), so reject it rather
+		// than hand the second caller an unprotected shared workspace.
 		acquired, err := lockWorktree(ctx, runGit, repoRoot, target)
 		if err != nil {
 			return Result{}, err
 		}
-		result.LockAcquired = acquired
+		if !acquired {
+			return Result{}, fmt.Errorf("worktree %s is locked by another active run; release it with `zero worktrees release %s` if that run is finished, or use a different --name", target, target)
+		}
+		result.LockAcquired = true
 		return result, nil
 	}
 	if err := os.MkdirAll(repoDir, 0o700); err != nil {
@@ -149,12 +157,17 @@ func Prepare(ctx context.Context, options Options) (Result, error) {
 	// network, or user for a long time") never force-removes a worktree zero
 	// itself is still using. entry.locked already makes Clean skip a worktree
 	// a human locked by hand; locking here extends that same protection to
-	// the worktrees zero creates.
-	if _, err := lockWorktree(ctx, runGit, repoRoot, target); err != nil {
+	// the worktrees zero creates. An "already locked" answer on a worktree
+	// this call just created means another process raced us to it: treat that
+	// exactly like the reuse collision above rather than claiming a lease
+	// this call never acquired.
+	acquired, err := lockWorktree(ctx, runGit, repoRoot, target)
+	if err != nil {
 		return Result{}, err
 	}
-	// This call created the worktree, so it owns the lease regardless of what
-	// git reported for the lock itself.
+	if !acquired {
+		return Result{}, fmt.Errorf("worktree %s is locked by another active run; release it with `zero worktrees release %s` if that run is finished, or use a different --name", target, target)
+	}
 	result.LockAcquired = true
 	return result, nil
 }

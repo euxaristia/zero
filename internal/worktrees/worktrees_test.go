@@ -199,12 +199,12 @@ func TestPrepareReusesExistingGitWorktree(t *testing.T) {
 	}
 }
 
-func TestPrepareReusedWorktreeKeepsExternalLock(t *testing.T) {
-	// A reused worktree that is still locked belongs to a live external
-	// `zero worktrees prepare` caller. Prepare must leave that lease in place
-	// and report LockAcquired=false so `zero exec --worktree` does not release
-	// a lock it never acquired (which would let a later Clean force-delete a
-	// workspace the external caller is still using).
+func TestPrepareRejectsWorktreeLockedByAnotherRun(t *testing.T) {
+	// A reused worktree that is still locked belongs to another live run.
+	// Handing that checkout to a second caller would let two runs edit one
+	// supposedly isolated tree, and whichever exits first would release the
+	// single Git lock out from under the other, so Prepare must reject the
+	// in-use lease instead of returning the path.
 	root := t.TempDir()
 	base := t.TempDir()
 	sourceGit := filepath.Join(root, ".git")
@@ -226,20 +226,66 @@ func TestPrepareReusedWorktreeKeepsExternalLock(t *testing.T) {
 		},
 	}
 
-	result, err := Prepare(context.Background(), Options{
+	_, err := Prepare(context.Background(), Options{
 		Cwd:     root,
 		Name:    "reuse-me",
 		BaseDir: base,
 		RunGit:  runner.Run,
 	})
-	if err != nil {
-		t.Fatalf("Prepare must tolerate an already-held lock, got error: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "locked by another active run") {
+		t.Fatalf("Prepare must reject an in-use lease, got %v", err)
 	}
-	if !result.Reused {
-		t.Fatalf("Reused = false, want true")
+}
+
+// TestPrepareValidatesRequestBeforeCleanup pins the order of validation and
+// the automatic stale-worktree pruning: a rejected request (an invalid
+// --name) must not have destructive cleanup side effects before it reports
+// its error. The second half proves the assertion has teeth: the same stale
+// worktree IS pruned once a valid request runs.
+func TestPrepareValidatesRequestBeforeCleanup(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	mustGit := func(args ...string) string {
+		t.Helper()
+		out, err := gitOutput(ctx, defaultRunGit, repo, args...)
+		if err != nil {
+			t.Skipf("git unavailable or failed (%v): %v", args, err)
+		}
+		return out
 	}
-	if result.LockAcquired {
-		t.Fatalf("LockAcquired = true, want false for a lease another caller holds")
+	mustGit("init")
+	mustGit("-c", "user.email=t@example.invalid", "-c", "user.name=t", "commit", "--allow-empty", "-m", "seed")
+	toplevel := filepath.Clean(mustGit("rev-parse", "--show-toplevel"))
+
+	base := t.TempDir()
+	staleDir := filepath.Join(base, "zero-worktree-"+repoKey(toplevel), "stale-task")
+	if err := os.MkdirAll(filepath.Dir(staleDir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mustGit("worktree", "add", "--detach", staleDir)
+	// Age every filesystem entry past the 24h staleness cutoff.
+	old := time.Now().Add(-48 * time.Hour)
+	if err := filepath.WalkDir(staleDir, func(path string, _ os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		return os.Chtimes(path, old, old)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Prepare(ctx, Options{Cwd: repo, BaseDir: base, Name: "../escape"}); err == nil {
+		t.Fatal("expected invalid-name error")
+	}
+	if _, err := os.Stat(staleDir); err != nil {
+		t.Fatalf("rejected request must not prune worktrees, stale dir: %v", err)
+	}
+
+	if _, err := Prepare(ctx, Options{Cwd: repo, BaseDir: base, Name: "fresh-task"}); err != nil {
+		t.Fatalf("valid Prepare: %v", err)
+	}
+	if _, err := os.Stat(staleDir); !os.IsNotExist(err) {
+		t.Fatalf("valid request should have pruned the stale worktree, stat err: %v", err)
 	}
 }
 

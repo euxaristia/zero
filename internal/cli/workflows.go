@@ -114,13 +114,24 @@ func runWorktrees(args []string, stdout io.Writer, stderr io.Writer, deps appDep
 // caller is responsible for running this once it is done.
 func runWorktreesRelease(args []string, stdout io.Writer, stderr io.Writer, deps appDeps) int {
 	var path string
-	for _, arg := range args {
+	var cwdFlag string
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
 		switch {
 		case arg == "-h" || arg == "--help" || arg == "help":
 			if err := writeWorktreesHelp(stdout); err != nil {
 				return exitCrash
 			}
 			return exitSuccess
+		case arg == "-C" || arg == "--cwd":
+			value, next, err := nextFlagValue(args, index, arg)
+			if err != nil {
+				return writeExecUsageError(stderr, err.Error())
+			}
+			cwdFlag = value
+			index = next
+		case strings.HasPrefix(arg, "--cwd="):
+			cwdFlag = strings.TrimPrefix(arg, "--cwd=")
 		case strings.HasPrefix(arg, "-"):
 			return writeExecUsageError(stderr, fmt.Sprintf("unknown worktrees release flag %q", arg))
 		default:
@@ -148,10 +159,19 @@ func runWorktreesRelease(args []string, stdout io.Writer, stderr io.Writer, deps
 	// no Cwd wired in, that recovery path runs `git worktree unlock` from
 	// wherever the caller happens to be, which outside the source repository
 	// leaves the orphaned lock behind forever (Clean skips locked entries).
-	// Resolve the workspace root best-effort: the ordinary existing-path case
-	// does not need it, so a resolution failure is not an error here.
+	// -C/--cwd names the source repository explicitly for exactly that case,
+	// since the deleted worktree path itself carries no way back to the repo;
+	// without the flag, resolve the launch directory best-effort (the
+	// ordinary existing-path case does not need it, so a resolution failure
+	// is not an error here).
 	releaseOptions := worktrees.Options{}
-	if workspaceRoot, rootErr := resolveWorkspaceRoot("", deps); rootErr == nil {
+	if cwdFlag != "" {
+		workspaceRoot, err := resolveWorkspaceRoot(cwdFlag, deps)
+		if err != nil {
+			return writeExecUsageError(stderr, err.Error())
+		}
+		releaseOptions.Cwd = workspaceRoot
+	} else if workspaceRoot, rootErr := resolveWorkspaceRoot("", deps); rootErr == nil {
 		releaseOptions.Cwd = workspaceRoot
 	}
 	if err := deps.releaseWorktree(context.Background(), releaseOptions, absPath); err != nil {
@@ -847,13 +867,15 @@ func formatCommitResult(result zerogit.CommitResult) string {
 func writeWorktreesHelp(w io.Writer) error {
 	_, err := fmt.Fprint(w, `Usage:
   zero worktrees prepare [flags] [name]
-  zero worktrees release <path>
+  zero worktrees release [flags] <path>
 
 Prepares an isolated git worktree for a Zero task.
 
 prepare locks the worktree it creates so Zero's automatic cleanup never
 removes it out from under you. release unlocks a worktree prepare created,
 once you are done with it, so cleanup can reclaim it later if it goes stale.
+If the worktree directory was deleted by hand, run release with -C pointing
+at the source repository so the orphaned lock can still be cleared.
 
 Flags:
       --name <name>       Worktree name; defaults to a timestamped task name
