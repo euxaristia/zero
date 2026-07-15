@@ -60,11 +60,52 @@ func TestBuildWindowsACLPlanForWorkspaceWriteProfile(t *testing.T) {
 	}
 	systemDrive, systemRoot, programData, publicDir := windowsSharedDenyPathsForTest(t)
 
-	for _, sid := range []string{workspaceSID, cacheSID, caps.ReadOnly} {
-		assertWindowsACLEntryInheritance(t, plan, WindowsACLDenyWrite, systemDrive+`\`, sid, false, true)
-		assertWindowsACLEntryInheritance(t, plan, WindowsACLDenyWrite, programData, sid, false, true)
-		assertWindowsACLEntryInheritance(t, plan, WindowsACLDenyWrite, systemRoot+`\Temp`, sid, false, true)
-		assertWindowsACLEntryInheritance(t, plan, WindowsACLDenyWrite, publicDir, sid, false, true)
+	// The shared system-path denies name only the one stable read-only SID
+	// that every broadened token carries. Naming the per-workspace/per-root
+	// SIDs here instead would append four permanent deny ACEs to these
+	// machine-wide DACLs for every distinct project ever sandboxed.
+	for _, path := range []string{systemDrive + `\`, programData, systemRoot + `\Temp`, publicDir} {
+		assertWindowsACLEntryInheritance(t, plan, WindowsACLDenyWrite, path, caps.ReadOnly, false, true)
+		for _, entry := range plan.Entries {
+			if entry.Action != WindowsACLDenyWrite || windowsCapabilityPathKey(entry.Path) != windowsCapabilityPathKey(path) {
+				continue
+			}
+			if entry.Capability == workspaceSID || entry.Capability == cacheSID {
+				t.Fatalf("shared deny path %q names per-root SID %q; machine DACLs must only carry the stable read-only SID", path, entry.Capability)
+			}
+		}
+	}
+}
+
+// TestBuildWindowsACLPlanOmitsSharedDenyPathsWithoutDenyRead pins the
+// scoping of the Users/Authenticated Users broadening: profiles without
+// DenyRead run under a WRITE_RESTRICTED token, which reads with its normal
+// identity and is never broadened, so their plans must not touch the shared
+// system-path DACLs at all.
+func TestBuildWindowsACLPlanOmitsSharedDenyPathsWithoutDenyRead(t *testing.T) {
+	home := t.TempDir()
+	plan, err := BuildWindowsACLPlan(WindowsSandboxCommandConfig{
+		SandboxHome:    home,
+		WorkspaceRoots: []string{`C:\workspace`},
+		SandboxLevel:   WindowsSandboxLevelRestrictedToken,
+		PermissionProfile: PermissionProfile{
+			FileSystem: FileSystemPolicy{
+				Kind:       FileSystemRestricted,
+				WriteRoots: []WritableRoot{{Root: `C:\workspace`}},
+			},
+			Network: NetworkPolicy{Mode: NetworkDeny},
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildWindowsACLPlan: %v", err)
+	}
+	systemDrive, systemRoot, programData, publicDir := windowsSharedDenyPathsForTest(t)
+	for _, path := range []string{systemDrive + `\`, programData, systemRoot + `\Temp`, publicDir} {
+		for _, entry := range plan.Entries {
+			if entry.Action == WindowsACLDenyWrite && windowsCapabilityPathKey(entry.Path) == windowsCapabilityPathKey(path) {
+				t.Fatalf("plan without DenyRead touches shared path %q: %#v", path, entry)
+			}
+		}
 	}
 }
 

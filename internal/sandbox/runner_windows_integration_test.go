@@ -72,13 +72,13 @@ func TestWindowsRestrictedTokenRealSandboxSmoke(t *testing.T) {
 		t.Fatalf("sandboxed write marker = %q, %v; want ok", bytes, err)
 	}
 
-	// The elevated tier's restricted token carries the Users/Authenticated
-	// Users SIDs (added for Program Files/System32 reads), which also match
-	// the write grant those groups already hold on C:\Users\Public. Pin that
-	// BuildWindowsACLPlan's DenyWrite mitigation still blocks a write there:
-	// an independent shared-writable directory outside every carved-out
-	// system path (ProgramData, Windows\Temp), and outside every workspace
-	// write root.
+	// This profile has no DenyRead paths, so its WRITE_RESTRICTED token is
+	// never broadened with the Users/Authenticated Users SIDs (see
+	// createWindowsRestrictedTokenFromBase): the write grant those groups
+	// hold on C:\Users\Public must not be reachable through the restricted
+	// SID check at all. Pin that a write there fails: an independent
+	// shared-writable directory outside every carved-out system path
+	// (ProgramData, Windows\Temp), and outside every workspace write root.
 	publicDir := os.Getenv("PUBLIC")
 	if publicDir == "" {
 		t.Skip("PUBLIC is not set; cannot probe C:\\Users\\Public write jail")

@@ -87,14 +87,19 @@ func createWindowsRestrictedTokenForCapabilitySIDs(capabilitySIDStrings []string
 // broadenReadSIDs is set, it also restricts to WinBuiltinUsersSid and
 // WinAuthenticatedUserSid so the sandboxed process can read/execute binaries
 // under paths like C:\Program Files or C:\Windows whose ACLs grant
-// Users/Authenticated Users rather than Everyone. Because the restricting-SID
-// check applies to writes as well as reads, this also grants write wherever
-// those groups already have it — BuildWindowsACLPlan mitigates that by adding
-// DenyWrite ACEs to the known shared Users/Authenticated-Users-writable
-// directories, but it can only do so with Administrator rights (see
-// WindowsSandboxLevelRestrictedToken). broadenReadSIDs must therefore stay
-// false for WindowsSandboxLevelUnelevated, which cannot enforce that
-// mitigation: it keeps the original (narrower) read scope instead of
+// Users/Authenticated Users rather than Everyone. That only matters on the
+// fully restricted token (writeRestricted=false), where reads also require a
+// restricted-SID match; a WRITE_RESTRICTED token reads with its normal
+// identity, so broadening it would gain nothing for reads while letting the
+// groups' write grants pass the restricted-SID write check. Because the
+// restricting-SID check applies to writes as well as reads, broadening also
+// grants write wherever those groups already have it — BuildWindowsACLPlan
+// mitigates that by adding DenyWrite ACEs to the known shared
+// Users/Authenticated-Users-writable directories, but it can only do so
+// with Administrator rights (see WindowsSandboxLevelRestrictedToken).
+// broadenReadSIDs must therefore stay false both when writeRestricted is set
+// and for WindowsSandboxLevelUnelevated, which cannot enforce that
+// mitigation: those keep the original (narrower) SID scope instead of
 // widening the write jail with nothing to close the gap.
 func createWindowsRestrictedTokenFromBase(base windows.Token, capabilitySIDs []windowsLocalSID, writeRestricted, broadenReadSIDs bool) (windows.Token, error) {
 	logonSID, err := copyWindowsLogonSID(base)
