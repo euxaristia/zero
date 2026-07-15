@@ -254,3 +254,24 @@ func windowsPathListContains(paths []string, want string) bool {
 	}
 	return false
 }
+
+// TestDedupeWindowsACLEntriesKeepsInheritanceVariants pins NoInherit as part
+// of the entry identity: a direct-only deny and an inheritable deny on the
+// same path and SID are different ACL shapes, and collapsing them could
+// silently promote a deliberately non-inherited shared-path deny into an
+// inheritable one that SetNamedSecurityInfo would propagate across a huge
+// existing subtree.
+func TestDedupeWindowsACLEntriesKeepsInheritanceVariants(t *testing.T) {
+	entries := []WindowsACLEntry{
+		{Action: WindowsACLDenyWrite, Path: `C:\shared`, Capability: "S-1-5-21-1", NoInherit: true},
+		{Action: WindowsACLDenyWrite, Path: `C:\shared`, Capability: "S-1-5-21-1"},
+		{Action: WindowsACLDenyWrite, Path: `C:\shared`, Capability: "S-1-5-21-1", NoInherit: true},
+	}
+	out := dedupeWindowsACLEntries(entries)
+	if len(out) != 2 {
+		t.Fatalf("dedupe = %#v, want the NoInherit and inheritable variants kept distinct", out)
+	}
+	if !out[0].NoInherit || out[1].NoInherit {
+		t.Fatalf("dedupe order/shape = %#v, want first NoInherit then inheritable", out)
+	}
+}
