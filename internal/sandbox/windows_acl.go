@@ -88,14 +88,15 @@ func BuildWindowsACLPlan(config WindowsSandboxCommandConfig) (WindowsACLPlan, er
 
 	// Deny write to shared Windows-writable directories (C:\, C:\ProgramData,
 	// C:\Windows\Temp, C:\Users\Public) to prevent write-jail escape via the
-	// added Users and Authenticated Users SIDs. Only the elevated tier
-	// (WindowsSandboxLevelRestrictedToken, applied by `zero sandbox setup`
-	// running as Administrator) reaches here with those SIDs on the token in
-	// the first place — see createWindowsRestrictedTokenFromBase — and only
-	// that tier has the WRITE_DAC needed to edit these system-owned DACLs.
-	// The unelevated tier keeps the narrower (pre-widening) restricting-SID
-	// set and never needs these entries.
-	if config.SandboxLevel == WindowsSandboxLevelRestrictedToken {
+	// added Users and Authenticated Users SIDs. Only DenyRead profiles on the
+	// elevated tier (WindowsSandboxLevelRestrictedToken, applied by `zero
+	// sandbox setup` running as Administrator) carry those SIDs at all: a
+	// WRITE_RESTRICTED token reads with its normal identity and is never
+	// broadened, so the default profile needs no shared entries, and only
+	// the elevated tier has the WRITE_DAC needed to edit these system-owned
+	// DACLs. The unelevated tier keeps the narrower restricting-SID set and
+	// never needs these entries either.
+	if config.SandboxLevel == WindowsSandboxLevelRestrictedToken && len(config.PermissionProfile.FileSystem.DenyRead) > 0 {
 		// Resolved from trusted Win32 APIs, not from the
 		// SystemDrive/SystemRoot/ProgramData/PUBLIC environment variables:
 		// see resolveWindowsSharedDenyPaths for why trusting the environment
@@ -112,15 +113,19 @@ func BuildWindowsACLPlan(config WindowsSandboxCommandConfig) (WindowsACLPlan, er
 			publicDir,
 		}
 
+		// The deny ACEs name only the stable read-only capability SID, which
+		// every broadened token carries (see the runner): a deny ACE blocks
+		// when it matches ANY SID on the token, so one shared identity is
+		// sufficient, and it keeps these machine-wide DACLs at a constant
+		// four entries total. Naming the per-workspace/per-root capability
+		// SIDs here instead would append four permanent deny ACEs for every
+		// distinct project ever sandboxed on the machine, growing C:\,
+		// ProgramData, Windows\Temp, and Public's DACLs without bound.
 		caps, err := LoadOrCreateWindowsCapabilitySIDs(config.SandboxHome)
 		if err != nil {
 			return WindowsACLPlan{}, err
 		}
-		var allSIDs []string
-		for _, cap := range writeCapabilities {
-			allSIDs = append(allSIDs, cap.SID)
-		}
-		allSIDs = append(allSIDs, caps.ReadOnly)
+		denySID := caps.ReadOnly
 
 		for _, denyPath := range sharedDenyPaths {
 			if windowsPathEqualsAnyRoot(denyPath, writeCapabilities) {
@@ -142,14 +147,12 @@ func BuildWindowsACLPlan(config WindowsSandboxCommandConfig) (WindowsACLPlan, er
 			// on each one is sufficient: it blocks the denied SIDs from
 			// writing (including creating new children) directly under that
 			// path without ever touching any descendant's own ACL.
-			for _, sid := range allSIDs {
-				entries = append(entries, WindowsACLEntry{
-					Action:     WindowsACLDenyWrite,
-					Path:       denyPath,
-					Capability: sid,
-					NoInherit:  true,
-				})
-			}
+			entries = append(entries, WindowsACLEntry{
+				Action:     WindowsACLDenyWrite,
+				Path:       denyPath,
+				Capability: denySID,
+				NoInherit:  true,
+			})
 		}
 	}
 

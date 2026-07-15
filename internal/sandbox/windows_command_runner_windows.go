@@ -75,10 +75,30 @@ func runWindowsSandboxCommand(config WindowsSandboxCommandConfig, stderr io.Writ
 	// reads under that flag (#612). Profiles with DenyRead keep the fully
 	// restricted token, trading spawn capability for read-deny enforcement.
 	writeRestricted := len(config.PermissionProfile.FileSystem.DenyRead) == 0
-	// Only the elevated restricted-token tier can enforce the DenyWrite
-	// mitigation BuildWindowsACLPlan adds for the broadened read SIDs (it
-	// requires Administrator rights); see createWindowsRestrictedTokenFromBase.
-	broadenReadSIDs := config.SandboxLevel == WindowsSandboxLevelRestrictedToken
+	// Broadening with Users/Authenticated Users is only useful on the fully
+	// restricted token, where READS also require a restricted-SID match and
+	// system paths like Program Files and System32 grant those groups rather
+	// than Everyone. A WRITE_RESTRICTED token already performs reads with the
+	// normal token identity, so broadening there cannot improve reads at all;
+	// it would only let Users/Authenticated Users write grants pass the
+	// restricted-SID write check and weaken the default write jail for no
+	// benefit. It also needs the elevated tier: only that tier can enforce
+	// the shared-directory DenyWrite mitigation BuildWindowsACLPlan adds for
+	// the broadened SIDs (it requires Administrator rights); see
+	// createWindowsRestrictedTokenFromBase.
+	broadenReadSIDs := config.SandboxLevel == WindowsSandboxLevelRestrictedToken && !writeRestricted
+	if broadenReadSIDs {
+		// The shared-directory DenyWrite mitigation names the one stable
+		// read-only capability SID rather than the per-workspace SIDs (see
+		// BuildWindowsACLPlan), so every broadened token must carry it for
+		// those deny ACEs to bind.
+		caps, err := LoadOrCreateWindowsCapabilitySIDs(config.SandboxHome)
+		if err != nil {
+			fmt.Fprintln(stderr, WindowsSandboxCommandRunnerName+": "+err.Error())
+			return 1
+		}
+		tokenSIDs = append(tokenSIDs, caps.ReadOnly)
+	}
 	token, err := createWindowsRestrictedTokenForCapabilitySIDs(tokenSIDs, writeRestricted, broadenReadSIDs)
 	if err != nil {
 		fmt.Fprintln(stderr, WindowsSandboxCommandRunnerName+": "+err.Error())
