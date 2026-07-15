@@ -277,7 +277,11 @@ func dedupeWindowsACLEntries(entries []WindowsACLEntry) []WindowsACLEntry {
 		if entry.Action == "" || strings.TrimSpace(entry.Path) == "" || strings.TrimSpace(entry.Capability) == "" {
 			continue
 		}
-		key := string(entry.Action) + "\x00" + windowsCapabilityPathKey(entry.Path) + "\x00" + strings.ToLower(entry.Capability)
+		// NoInherit is part of the identity: a direct-only deny and an
+		// inheritable one on the same path/SID are different ACL shapes, and
+		// collapsing them could silently promote a deliberately non-inherited
+		// shared-path deny into an inheritable one (or vice versa).
+		key := string(entry.Action) + "\x00" + windowsCapabilityPathKey(entry.Path) + "\x00" + strings.ToLower(entry.Capability) + "\x00" + fmt.Sprintf("%t", entry.NoInherit)
 		if _, ok := seen[key]; ok {
 			continue
 		}
