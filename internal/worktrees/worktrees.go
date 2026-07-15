@@ -41,6 +41,10 @@ type Result struct {
 	SourceBranch string `json:"sourceBranch,omitempty"`
 	SourceCommit string `json:"sourceCommit,omitempty"`
 	Reused       bool   `json:"reused"`
+	// LockAcquired reports whether this Prepare call took the worktree lock.
+	// It is false when a reused worktree was already locked by another live
+	// caller; releasing that lease is that caller's responsibility, not ours.
+	LockAcquired bool `json:"lockAcquired"`
 }
 
 var worktreeNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$`)
@@ -113,6 +117,17 @@ func Prepare(ctx context.Context, options Options) (Result, error) {
 			return Result{}, fmt.Errorf("worktree path already exists for a different git repository: %s", target)
 		}
 		result.Reused = true
+		// A reused worktree may have been released by a prior run's exit, and
+		// an unlocked target is exposed to Clean's staleness heuristic while
+		// this caller is still using it, so re-establish the lease here. A
+		// lock already held (an external prepare caller is still using the
+		// path) stays in place and is reported via LockAcquired=false so this
+		// caller knows the release duty is not its own.
+		acquired, err := lockWorktree(ctx, runGit, repoRoot, target)
+		if err != nil {
+			return Result{}, err
+		}
+		result.LockAcquired = acquired
 		return result, nil
 	}
 	if err := os.MkdirAll(repoDir, 0o700); err != nil {
@@ -135,18 +150,35 @@ func Prepare(ctx context.Context, options Options) (Result, error) {
 	// itself is still using. entry.locked already makes Clean skip a worktree
 	// a human locked by hand; locking here extends that same protection to
 	// the worktrees zero creates.
+	if _, err := lockWorktree(ctx, runGit, repoRoot, target); err != nil {
+		return Result{}, err
+	}
+	// This call created the worktree, so it owns the lease regardless of what
+	// git reported for the lock itself.
+	result.LockAcquired = true
+	return result, nil
+}
+
+// lockWorktree takes the Clean-protection lease on target via `git worktree
+// lock`. It reports whether this call acquired the lease: a lock already held
+// by someone else is left in place and reported as not acquired, so the
+// caller knows the matching Release belongs to the lease's original owner.
+func lockWorktree(ctx context.Context, runGit GitRunner, repoRoot string, target string) (bool, error) {
 	lockResult, err := runGit(ctx, repoRoot, "worktree", "lock", "--reason", "zero: active task worktree", target)
 	if err != nil {
-		return Result{}, fmt.Errorf("lock git worktree: %w", err)
+		return false, fmt.Errorf("lock git worktree: %w", err)
 	}
-	if lockResult.ExitCode != 0 {
-		message := strings.TrimSpace(firstNonEmpty(lockResult.Stderr, lockResult.Stdout))
-		if message == "" {
-			message = fmt.Sprintf("git worktree lock exited with code %d", lockResult.ExitCode)
-		}
-		return Result{}, fmt.Errorf("lock git worktree: %s", message)
+	if lockResult.ExitCode == 0 {
+		return true, nil
 	}
-	return result, nil
+	message := strings.TrimSpace(firstNonEmpty(lockResult.Stderr, lockResult.Stdout))
+	if strings.Contains(message, "already locked") {
+		return false, nil
+	}
+	if message == "" {
+		message = fmt.Sprintf("git worktree lock exited with code %d", lockResult.ExitCode)
+	}
+	return false, fmt.Errorf("lock git worktree: %s", message)
 }
 
 // Release unlocks a worktree that Prepare locked, via `git worktree unlock`,

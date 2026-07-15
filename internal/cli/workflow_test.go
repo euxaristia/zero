@@ -201,6 +201,15 @@ func TestRunWorktreesReleaseNormalizesRelativePath(t *testing.T) {
 		}
 	}()
 
+	// filepath.Abs resolves against os.Getwd, whose spelling of the temp dir
+	// can differ from t.TempDir()'s (macOS reports /private/var for /var), so
+	// derive the expected value through the same resolution instead of
+	// joining onto the lexical parent path.
+	expectedPath, err := filepath.Abs("task-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	var releasedPath string
 	var stdout, stderr bytes.Buffer
 	exitCode := runWithDeps([]string{"worktrees", "release", "task-a"}, &stdout, &stderr, appDeps{
@@ -213,8 +222,8 @@ func TestRunWorktreesReleaseNormalizesRelativePath(t *testing.T) {
 	if exitCode != exitSuccess {
 		t.Fatalf("expected exit code %d, got %d: %s", exitSuccess, exitCode, stderr.String())
 	}
-	if releasedPath != worktreeDir {
-		t.Fatalf("released path = %q, want absolute %q", releasedPath, worktreeDir)
+	if releasedPath != expectedPath {
+		t.Fatalf("released path = %q, want absolute %q", releasedPath, expectedPath)
 	}
 }
 
@@ -233,6 +242,33 @@ func TestRunWorktreesReleaseRequiresPath(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "requires a worktree path") {
 		t.Fatalf("expected missing-path error, got %q", stderr.String())
+	}
+}
+
+func TestRunWorktreesReleaseWiresWorkspaceCwd(t *testing.T) {
+	// Release only consults Options.Cwd when the worktree directory itself is
+	// already gone (deleted by hand instead of released); git then has to run
+	// from the source repository to clear the orphaned lock. The CLI must
+	// wire the resolved workspace root through, or that advertised recovery
+	// path runs git from a possibly non-repository directory and the lock is
+	// never cleared (Clean skips locked entries).
+	root := t.TempDir()
+	var gotCwd string
+
+	var stdout, stderr bytes.Buffer
+	exitCode := runWithDeps([]string{"worktrees", "release", filepath.Join(root, "already-deleted")}, &stdout, &stderr, appDeps{
+		getwd: func() (string, error) { return root, nil },
+		releaseWorktree: func(ctx context.Context, options worktrees.Options, path string) error {
+			gotCwd = options.Cwd
+			return nil
+		},
+	})
+
+	if exitCode != exitSuccess {
+		t.Fatalf("expected exit code %d, got %d: %s", exitSuccess, exitCode, stderr.String())
+	}
+	if gotCwd != root {
+		t.Fatalf("release Options.Cwd = %q, want workspace root %q", gotCwd, root)
 	}
 }
 
@@ -732,7 +768,7 @@ func TestRunExecWorktreeReleasesLockAfterRun(t *testing.T) {
 	exitCode := runWithDeps([]string{"exec", "--worktree", "task-a", "hello"}, &stdout, &stderr, appDeps{
 		getwd: func() (string, error) { return root, nil },
 		prepareWorktree: func(ctx context.Context, options worktrees.Options) (worktrees.Result, error) {
-			return worktrees.Result{Name: "task-a", Path: worktreeDir, RepoRoot: root, SourceBranch: "main", SourceCommit: "abc1234"}, nil
+			return worktrees.Result{Name: "task-a", Path: worktreeDir, RepoRoot: root, SourceBranch: "main", SourceCommit: "abc1234", LockAcquired: true}, nil
 		},
 		releaseWorktree: func(ctx context.Context, options worktrees.Options, path string) error {
 			releaseCalls++
@@ -760,6 +796,76 @@ func TestRunExecWorktreeReleasesLockAfterRun(t *testing.T) {
 	}
 	if releasedPath != worktreeDir {
 		t.Fatalf("released path = %q, want %q", releasedPath, worktreeDir)
+	}
+}
+
+func TestRunExecWorktreeKeepsLockItDidNotAcquire(t *testing.T) {
+	// Prepare reports LockAcquired=false when it reused a worktree whose lock
+	// an external `zero worktrees prepare` caller still holds. Releasing that
+	// lock here would clear the external caller's lease and let a later Clean
+	// force-delete a workspace that caller is still using, so exec must only
+	// release the ownership its own invocation established.
+	root := t.TempDir()
+	worktreeDir := t.TempDir()
+	releaseCalls := 0
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	exitCode := runWithDeps([]string{"exec", "--worktree", "task-a", "hello"}, &stdout, &stderr, appDeps{
+		getwd: func() (string, error) { return root, nil },
+		prepareWorktree: func(ctx context.Context, options worktrees.Options) (worktrees.Result, error) {
+			return worktrees.Result{Name: "task-a", Path: worktreeDir, RepoRoot: root, SourceBranch: "main", SourceCommit: "abc1234", Reused: true, LockAcquired: false}, nil
+		},
+		releaseWorktree: func(ctx context.Context, options worktrees.Options, path string) error {
+			releaseCalls++
+			return nil
+		},
+		resolveConfig: func(workspaceRoot string, overrides config.Overrides) (config.ResolvedConfig, error) {
+			return execResolvedConfig(), nil
+		},
+		newProvider: func(config.ProviderProfile) (zeroruntime.Provider, error) {
+			return echoExecProvider{}, nil
+		},
+	})
+
+	if exitCode != exitSuccess {
+		t.Fatalf("expected exit code %d, got %d: %s", exitSuccess, exitCode, stderr.String())
+	}
+	if releaseCalls != 0 {
+		t.Fatalf("releaseWorktree call count = %d, want 0 for a lock this run did not acquire", releaseCalls)
+	}
+}
+
+func TestRunExecWorktreeSurfacesReleaseFailure(t *testing.T) {
+	// A failed unlock leaves a lock Clean permanently skips, recreating the
+	// disk leak silently; the failure must reach the user with the affected
+	// path so the leaked lock can be cleared by hand.
+	root := t.TempDir()
+	worktreeDir := t.TempDir()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	exitCode := runWithDeps([]string{"exec", "--worktree", "task-a", "hello"}, &stdout, &stderr, appDeps{
+		getwd: func() (string, error) { return root, nil },
+		prepareWorktree: func(ctx context.Context, options worktrees.Options) (worktrees.Result, error) {
+			return worktrees.Result{Name: "task-a", Path: worktreeDir, RepoRoot: root, SourceBranch: "main", SourceCommit: "abc1234", LockAcquired: true}, nil
+		},
+		releaseWorktree: func(ctx context.Context, options worktrees.Options, path string) error {
+			return errors.New("unlock git worktree: boom")
+		},
+		resolveConfig: func(workspaceRoot string, overrides config.Overrides) (config.ResolvedConfig, error) {
+			return execResolvedConfig(), nil
+		},
+		newProvider: func(config.ProviderProfile) (zeroruntime.Provider, error) {
+			return echoExecProvider{}, nil
+		},
+	})
+
+	if exitCode != exitSuccess {
+		t.Fatalf("expected exit code %d, got %d: %s", exitSuccess, exitCode, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), worktreeDir) || !strings.Contains(stderr.String(), "boom") {
+		t.Fatalf("expected release failure with path on stderr, got %q", stderr.String())
 	}
 }
 

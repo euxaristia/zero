@@ -143,7 +143,18 @@ func runWorktreesRelease(args []string, stdout io.Writer, stderr io.Writer, deps
 	if err != nil {
 		return writeExecUsageError(stderr, err.Error())
 	}
-	if err := deps.releaseWorktree(context.Background(), worktrees.Options{}, absPath); err != nil {
+	// Release falls back to Options.Cwd as git's working directory when the
+	// worktree directory itself was deleted by hand instead of released; with
+	// no Cwd wired in, that recovery path runs `git worktree unlock` from
+	// wherever the caller happens to be, which outside the source repository
+	// leaves the orphaned lock behind forever (Clean skips locked entries).
+	// Resolve the workspace root best-effort: the ordinary existing-path case
+	// does not need it, so a resolution failure is not an error here.
+	releaseOptions := worktrees.Options{}
+	if workspaceRoot, rootErr := resolveWorkspaceRoot("", deps); rootErr == nil {
+		releaseOptions.Cwd = workspaceRoot
+	}
+	if err := deps.releaseWorktree(context.Background(), releaseOptions, absPath); err != nil {
 		return writeExecUsageError(stderr, err.Error())
 	}
 	if _, err := fmt.Fprintf(stdout, "released %s\n", path); err != nil {

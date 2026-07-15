@@ -85,6 +85,9 @@ func TestPrepareCreatesDetachedGitWorktree(t *testing.T) {
 	if got := runner.commandLine(4); got != "git worktree lock --reason zero: active task worktree "+result.Path {
 		t.Fatalf("git worktree lock command = %q", got)
 	}
+	if !result.LockAcquired {
+		t.Fatalf("LockAcquired = false, want true for a worktree this call created")
+	}
 }
 
 func TestReleaseUnlocksWorktree(t *testing.T) {
@@ -162,6 +165,7 @@ func TestPrepareReusesExistingGitWorktree(t *testing.T) {
 			{Stdout: "abc1234\n"},
 			{Stdout: sourceGit + "\n"},
 			{Stdout: sourceGit + "\n"},
+			{},
 		},
 	}
 
@@ -181,8 +185,61 @@ func TestPrepareReusesExistingGitWorktree(t *testing.T) {
 	if result.Path != existing {
 		t.Fatalf("Path = %q, want existing %q", result.Path, existing)
 	}
-	if len(runner.calls) != 5 {
-		t.Fatalf("expected metadata git calls only, got %#v", runner.calls)
+	if len(runner.calls) != 6 {
+		t.Fatalf("expected metadata git calls plus lock, got %#v", runner.calls)
+	}
+	// The original lock may have been released by a prior run's exit, which
+	// would leave the reused worktree exposed to Clean's staleness heuristic
+	// while this caller is still using it: reuse must re-establish the lease.
+	if got := runner.commandLine(5); got != "git worktree lock --reason zero: active task worktree "+existing {
+		t.Fatalf("git worktree lock command = %q", got)
+	}
+	if !result.LockAcquired {
+		t.Fatalf("LockAcquired = false, want true for a lease this call took")
+	}
+}
+
+func TestPrepareReusedWorktreeKeepsExternalLock(t *testing.T) {
+	// A reused worktree that is still locked belongs to a live external
+	// `zero worktrees prepare` caller. Prepare must leave that lease in place
+	// and report LockAcquired=false so `zero exec --worktree` does not release
+	// a lock it never acquired (which would let a later Clean force-delete a
+	// workspace the external caller is still using).
+	root := t.TempDir()
+	base := t.TempDir()
+	sourceGit := filepath.Join(root, ".git")
+	if err := os.MkdirAll(sourceGit, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	existing := filepath.Join(base, "zero-worktree-"+repoKey(root), "reuse-me")
+	if err := os.MkdirAll(filepath.Join(existing, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeRunner{
+		results: []CommandResult{
+			{Stdout: root + "\n"},
+			{Stdout: "main\n"},
+			{Stdout: "abc1234\n"},
+			{Stdout: sourceGit + "\n"},
+			{Stdout: sourceGit + "\n"},
+			{ExitCode: 128, Stderr: "fatal: '" + existing + "' is already locked, reason: zero: active task worktree"},
+		},
+	}
+
+	result, err := Prepare(context.Background(), Options{
+		Cwd:     root,
+		Name:    "reuse-me",
+		BaseDir: base,
+		RunGit:  runner.Run,
+	})
+	if err != nil {
+		t.Fatalf("Prepare must tolerate an already-held lock, got error: %v", err)
+	}
+	if !result.Reused {
+		t.Fatalf("Reused = false, want true")
+	}
+	if result.LockAcquired {
+		t.Fatalf("LockAcquired = true, want false for a lease another caller holds")
 	}
 }
 
