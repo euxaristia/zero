@@ -36,3 +36,8 @@ require (
 	golang.org/x/exp v0.0.0-20260611194520-c48552f49976 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 )
+
+// DEBUG ONLY: patched bubbletea to test whether disabling scroll-region
+// optimization (via ZERO_DEBUG_NO_SCROLL_OPTIM=1) fixes rendering distortion
+// seen over multipass + Windows Terminal. Not for merging upstream.
+replace charm.land/bubbletea/v2 => ./third_party/bubbletea-v2-debug-noscrolloptim
