@@ -275,8 +275,8 @@ func TestNewThemePresetsWired(t *testing.T) {
 	if !ok {
 		t.Fatal("theme 'dune' is not registered")
 	}
-	if dune.IsDark {
-		t.Error("theme 'dune' should be marked as light")
+	if !dune.IsDark {
+		t.Error("theme 'dune' should be marked as dark")
 	}
 
 	for _, name := range []string{"neon", "dune"} {
