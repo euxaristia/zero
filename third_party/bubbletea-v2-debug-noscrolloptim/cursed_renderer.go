@@ -259,6 +259,15 @@ func (s *cursedRenderer) flush(closing bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if os.Getenv("ZERO_DEBUG_FORCE_FULL_REDRAW") != "" {
+		// TEMP DEBUG: bypass the cell diff and force every frame to be a full
+		// repaint, to isolate whether stale glyphs (e.g. leftover streaming
+		// cursor characters) come from the diff engine skipping vacated
+		// cells, or from the write path (e.g. ANSI sequences getting split
+		// or dropped over a remote pty).
+		s.scr.Erase()
+	}
+
 	view := s.view
 	frameArea := uv.Rect(0, 0, s.width, s.height)
 	if len(view.Content) == 0 {
