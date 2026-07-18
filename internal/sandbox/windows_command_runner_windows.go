@@ -86,7 +86,16 @@ func runWindowsSandboxCommand(config WindowsSandboxCommandConfig, stderr io.Writ
 	// the shared-directory DenyWrite mitigation BuildWindowsACLPlan adds for
 	// the broadened SIDs (it requires Administrator rights); see
 	// createWindowsRestrictedTokenFromBase.
-	broadenReadSIDs := config.SandboxLevel == WindowsSandboxLevelRestrictedToken && !writeRestricted
+	// The broadened identities are also gated on the machine's volume
+	// layout: the compensating shared-path DenyWrite mitigation covers only
+	// system-drive paths, so on a host with any other fixed volume (whose
+	// root typically grants Authenticated Users Modify with volume-wide
+	// inheritance) the broadened token could write outside every configured
+	// write root. Fail closed there and keep the narrow SID set — reads of
+	// Users-granted system paths stay broken on such hosts, but the write
+	// jail holds.
+	broadenReadSIDs := config.SandboxLevel == WindowsSandboxLevelRestrictedToken && !writeRestricted &&
+		windowsSystemDriveIsOnlyFixedVolume()
 	if broadenReadSIDs {
 		// The shared-directory DenyWrite mitigation names the one stable
 		// read-only capability SID rather than the per-workspace SIDs (see

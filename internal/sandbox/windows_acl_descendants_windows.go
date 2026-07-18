@@ -263,6 +263,13 @@ func windowsDirGrantsBroadenedWrite(path string) (bool, error) {
 		if err := windows.GetAce(dacl, uint32(index), &ace); err != nil {
 			return false, fmt.Errorf("read ACE %d of %s: %w", index, path, err)
 		}
+		// An INHERIT_ONLY ACE does not apply to this object itself — it only
+		// seeds ACLs of newly created children. Counting one here could let
+		// an inherit-only deny suppress a later applicable allow in
+		// deniedWrite, misclassifying a writable directory as safe.
+		if ace.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0 {
+			continue
+		}
 		sid, ok := windowsAceSID(ace)
 		if !ok {
 			continue
