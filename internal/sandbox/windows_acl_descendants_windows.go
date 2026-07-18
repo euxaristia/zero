@@ -101,10 +101,13 @@ func applyWindowsSharedDescendantDenies(root, denySID string, writeRoots []strin
 	return snapshots, nil
 }
 
-// windowsEnumerateWritableDescendants returns the existing directories below
-// root that grant BUILTIN\Users or Authenticated Users write, excluding any
-// configured write root (and anything under it) so legitimate workspace writes
-// are never jailed. See the package-level comment above for the traversal
+// windowsEnumerateWritableDescendants returns the existing files and
+// directories below root that grant BUILTIN\Users or Authenticated Users
+// write, excluding any configured write root (and anything under it) so
+// legitimate workspace writes are never jailed. Files are checked and denied
+// just like directories — a writable file directly under a shared root is as
+// much an escape surface as a writable directory — but only directories are
+// descended into. See the package-level comment above for the traversal
 // bounds and their rationale.
 func windowsEnumerateWritableDescendants(root string, writeRoots []string) ([]string, error) {
 	if windowsCapabilityPathKey(root) == "" {
@@ -145,9 +148,6 @@ func windowsEnumerateWritableDescendants(root string, writeRoots []string) ([]st
 			continue
 		}
 		for _, entry := range entries {
-			if !entry.IsDir() {
-				continue
-			}
 			child := filepath.Join(current.path, entry.Name())
 			childKey := windowsCapabilityPathKey(child)
 			if isExcluded(childKey) {
@@ -169,6 +169,11 @@ func windowsEnumerateWritableDescendants(root string, writeRoots []string) ([]st
 			if writable {
 				out = append(out, child)
 			}
+			if !entry.IsDir() {
+				// A file has no descendants to walk; it either got denied above
+				// or was not writable, either way there is nothing further to do.
+				continue
+			}
 			childDepth := current.depth + 1
 			if childDepth >= windowsDescendantScanMaxDepth {
 				continue
@@ -179,6 +184,56 @@ func windowsEnumerateWritableDescendants(root string, writeRoots []string) ([]st
 		}
 	}
 	return out, nil
+}
+
+// windowsAccessAllowedObjectAceType and windowsAccessDeniedObjectAceType are
+// the AceType values for ACCESS_ALLOWED_OBJECT_ACE / ACCESS_DENIED_OBJECT_ACE
+// (https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-access_allowed_object_ace).
+// x/sys/windows only models the plain ACCESS_ALLOWED_ACE layout (Header, Mask,
+// SidStart) and exposes just ACCESS_ALLOWED_ACE_TYPE/ACCESS_DENIED_ACE_TYPE, so
+// these two are declared locally.
+const (
+	windowsAccessAllowedObjectAceType = 0x05
+	windowsAccessDeniedObjectAceType  = 0x06
+)
+
+// windowsAceSID locates the trustee SID within ace, an *ACCESS_ALLOWED_ACE
+// pointer that GetAce hands back regardless of the ACE's true type — for
+// object ACEs that pointer is only valid for reading Header/Mask, not
+// SidStart. An object ACE (ACCESS_ALLOWED_OBJECT_ACE / ACCESS_DENIED_OBJECT_ACE)
+// inserts a Flags DWORD and up to two conditionally-present 16-byte GUIDs
+// (ObjectType, InheritedObjectType) between Mask and the real SID; naively
+// reading &ace.SidStart for one of these — as if it had the plain ACE layout —
+// reinterprets Flags/GUID bytes as SID bytes and silently computes the wrong
+// trustee, both risking a false match and missing a real Users/Authenticated
+// Users grant hidden inside an object ACE. ok is false for any other ACE type
+// (audit, alarm, mandatory label, compound, ...), which does not represent a
+// trustee write grant in the sense this scan cares about and is skipped
+// exactly as it always has been.
+func windowsAceSID(ace *windows.ACCESS_ALLOWED_ACE) (sid *windows.SID, ok bool) {
+	switch ace.Header.AceType {
+	case windows.ACCESS_ALLOWED_ACE_TYPE, windows.ACCESS_DENIED_ACE_TYPE:
+		return (*windows.SID)(unsafe.Pointer(&ace.SidStart)), true
+	case windowsAccessAllowedObjectAceType, windowsAccessDeniedObjectAceType:
+		// For an object ACE, the memory the Go struct calls SidStart is
+		// actually the ACE's Flags DWORD; the real SID sits further out,
+		// pushed by whichever of the two optional GUIDs Flags says are present.
+		// offset is plain arithmetic on a byte count, never itself derived from
+		// a pointer conversion, so accumulating it across statements is safe;
+		// only the final pointer+offset conversion below needs to happen in a
+		// single expression (go vet's unsafeptr rule).
+		flags := ace.SidStart
+		offset := unsafe.Sizeof(ace.SidStart)
+		if flags&windows.ACE_OBJECT_TYPE_PRESENT != 0 {
+			offset += 16
+		}
+		if flags&windows.ACE_INHERITED_OBJECT_TYPE_PRESENT != 0 {
+			offset += 16
+		}
+		return (*windows.SID)(unsafe.Pointer(uintptr(unsafe.Pointer(&ace.SidStart)) + offset)), true
+	default:
+		return nil, false
+	}
 }
 
 // windowsDirGrantsBroadenedWrite reports whether path's effective DACL lets
@@ -208,7 +263,10 @@ func windowsDirGrantsBroadenedWrite(path string) (bool, error) {
 		if err := windows.GetAce(dacl, uint32(index), &ace); err != nil {
 			return false, fmt.Errorf("read ACE %d of %s: %w", index, path, err)
 		}
-		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+		sid, ok := windowsAceSID(ace)
+		if !ok {
+			continue
+		}
 		if !sid.IsWellKnown(windows.WinBuiltinUsersSid) && !sid.IsWellKnown(windows.WinAuthenticatedUserSid) {
 			continue
 		}
@@ -217,9 +275,9 @@ func windowsDirGrantsBroadenedWrite(path string) (bool, error) {
 			continue
 		}
 		switch ace.Header.AceType {
-		case windows.ACCESS_DENIED_ACE_TYPE:
+		case windows.ACCESS_DENIED_ACE_TYPE, windowsAccessDeniedObjectAceType:
 			deniedWrite |= writeBits
-		case windows.ACCESS_ALLOWED_ACE_TYPE:
+		case windows.ACCESS_ALLOWED_ACE_TYPE, windowsAccessAllowedObjectAceType:
 			if writeBits&^deniedWrite != 0 {
 				return true, nil
 			}

@@ -142,8 +142,8 @@ func BuildWindowsACLPlan(config WindowsSandboxCommandConfig) (WindowsACLPlan, er
 		denySID := caps.ReadOnly
 
 		for _, denyPath := range sharedDenyPaths {
-			if windowsPathEqualsAnyRoot(denyPath, writeCapabilities) {
-				continue // Do not deny write if it is exactly an allowed write root
+			if windowsPathUnderAnyRoot(denyPath, writeCapabilities) {
+				continue // Do not deny write if it IS or is nested under an allowed write root
 			}
 			// NoInherit: these four shared paths must NOT carry an inheritable
 			// ACE. SetNamedSecurityInfo automatically propagates any
@@ -183,13 +183,25 @@ func BuildWindowsACLPlan(config WindowsSandboxCommandConfig) (WindowsACLPlan, er
 	return WindowsACLPlan{Entries: dedupeWindowsACLEntries(entries)}, nil
 }
 
-func windowsPathEqualsAnyRoot(path string, capabilities []windowsWriteRootCapability) bool {
+// windowsPathUnderAnyRoot reports whether path is exactly, or nested under, one
+// of the configured write-root capabilities. A shared-path deny must skip both
+// cases: denying a root that IS a write root would block the workspace outright,
+// and denying a root that merely CONTAINS one (e.g. a shared path of
+// C:\Users\Public when C:\Users itself is a configured write root) would place
+// an explicit Deny ahead of that root's Allow for every broadened token,
+// winning under Windows' deny-before-allow evaluation and jailing a directory
+// the user explicitly configured as writable.
+func windowsPathUnderAnyRoot(path string, capabilities []windowsWriteRootCapability) bool {
 	key := windowsCapabilityPathKey(path)
 	if key == "" {
 		return false
 	}
 	for _, cap := range capabilities {
-		if windowsCapabilityPathKey(cap.Root) == key {
+		rootKey := windowsCapabilityPathKey(cap.Root)
+		if rootKey == "" {
+			continue
+		}
+		if key == rootKey || strings.HasPrefix(key, rootKey+`\`) {
 			return true
 		}
 	}

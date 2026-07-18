@@ -3,12 +3,23 @@
 package sandbox
 
 import (
+	"encoding/binary"
+	"os"
 	"path/filepath"
 	"testing"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
+
+// touchFile creates an empty file at path, failing the test on error.
+func touchFile(t *testing.T, path string) string {
+	t.Helper()
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatalf("WriteFile(%q): %v", path, err)
+	}
+	return path
+}
 
 // dirDeniesSID reports whether path's DACL carries a deny ACE naming the given
 // string SID. It reads the same way the descendant scan applies denies, so a
@@ -119,6 +130,8 @@ func TestWindowsEnumerateWritableDescendantsFindsExistingWritableChildren(t *tes
 	plain := mkdir(t, filepath.Join(root, "plain"))
 	workspace := mkdir(t, filepath.Join(root, "workspace"))
 	grantUsersWrite(t, workspace)
+	writableFile := touchFile(t, filepath.Join(root, "writable.txt"))
+	grantUsersWrite(t, writableFile)
 
 	found, err := windowsEnumerateWritableDescendants(root, nil)
 	if err != nil {
@@ -129,6 +142,9 @@ func TestWindowsEnumerateWritableDescendantsFindsExistingWritableChildren(t *tes
 	}
 	if !windowsPathListContains(found, inner) {
 		t.Fatalf("enumeration = %#v, want it to include nested writable descendant %q", found, inner)
+	}
+	if !windowsPathListContains(found, writableFile) {
+		t.Fatalf("enumeration = %#v, want it to include writable file %q (a file is as much an escape surface as a directory)", found, writableFile)
 	}
 
 	plainWritable, err := windowsDirGrantsBroadenedWrite(plain)
@@ -186,5 +202,65 @@ func TestApplyWindowsSharedDescendantDeniesAppliesAndRollsBack(t *testing.T) {
 	}
 	if dirDeniesSID(t, writable, caps.ReadOnly) {
 		t.Fatalf("descendant %q still denies %q after rollback", writable, caps.ReadOnly)
+	}
+}
+
+// TestWindowsAceSIDLocatesSIDInObjectACE pins the offset arithmetic
+// windowsAceSID relies on for ACCESS_ALLOWED_OBJECT_ACE / ACCESS_DENIED_OBJECT_ACE:
+// the real SID sits past a Flags DWORD and 0, 1, or 2 conditionally-present
+// 16-byte GUIDs (ObjectType, InheritedObjectType), never at the plain-ACE
+// SidStart offset GetAce's *ACCESS_ALLOWED_ACE typing would naively suggest.
+// This builds the raw ACE bytes directly, per Microsoft's documented layout,
+// because x/sys/windows has no AddAccessAllowedObjectAce binding to create a
+// real one through the OS.
+func TestWindowsAceSIDLocatesSIDInObjectACE(t *testing.T) {
+	usersSID, err := windows.CreateWellKnownSid(windows.WinBuiltinUsersSid)
+	if err != nil {
+		t.Fatalf("CreateWellKnownSid: %v", err)
+	}
+	sidBytes := unsafe.Slice((*byte)(unsafe.Pointer(usersSID)), usersSID.Len())
+
+	cases := []struct {
+		name    string
+		aceType byte
+		flags   uint32
+		guids   int // number of 16-byte GUIDs the flags say precede the SID
+	}{
+		{"no optional GUIDs", windowsAccessAllowedObjectAceType, 0, 0},
+		{"object type GUID only", windowsAccessAllowedObjectAceType, windows.ACE_OBJECT_TYPE_PRESENT, 1},
+		{"inherited type GUID only", windowsAccessDeniedObjectAceType, windows.ACE_INHERITED_OBJECT_TYPE_PRESENT, 1},
+		{"both GUIDs", windowsAccessDeniedObjectAceType, windows.ACE_OBJECT_TYPE_PRESENT | windows.ACE_INHERITED_OBJECT_TYPE_PRESENT, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Layout: ACE_HEADER(4) + Mask(4) + Flags(4) + guids*GUID(16) + SID.
+			buf := make([]byte, 4+4+4+16*tc.guids+len(sidBytes))
+			buf[0] = tc.aceType                                // Header.AceType
+			binary.LittleEndian.PutUint32(buf[8:12], tc.flags) // Flags, at the offset SidStart occupies in the plain-ACE layout
+			copy(buf[12+16*tc.guids:], sidBytes)
+
+			ace := (*windows.ACCESS_ALLOWED_ACE)(unsafe.Pointer(&buf[0]))
+			sid, ok := windowsAceSID(ace)
+			if !ok {
+				t.Fatal("windowsAceSID returned ok=false for a recognized object ACE type")
+			}
+			if !sid.Equals(usersSID) {
+				t.Fatalf("windowsAceSID = %s, want %s", sid.String(), usersSID.String())
+			}
+		})
+	}
+}
+
+// TestWindowsAceSIDSkipsUnhandledAceTypes confirms an ACE type this scan does
+// not model (audit, mandatory label, ...) is skipped rather than misread as a
+// plain or object ACE — the same conservative behavior the code had before
+// object-ACE support was added.
+func TestWindowsAceSIDSkipsUnhandledAceTypes(t *testing.T) {
+	const systemMandatoryLabelAceType = 0x11
+	buf := make([]byte, 32)
+	buf[0] = systemMandatoryLabelAceType
+	ace := (*windows.ACCESS_ALLOWED_ACE)(unsafe.Pointer(&buf[0]))
+	if _, ok := windowsAceSID(ace); ok {
+		t.Fatal("windowsAceSID should return ok=false for an unhandled ACE type")
 	}
 }
