@@ -13,7 +13,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -32,6 +34,14 @@ type Options struct {
 	Env     map[string]string
 	Now     func() time.Time
 	RunGit  GitRunner
+	// LeasePID, when positive, records the owning process in the worktree
+	// lock reason. A lease carrying a PID is recoverable: if that process
+	// dies without releasing (SIGKILL, crash, power loss), Clean can expire
+	// the lease instead of skipping the locked worktree forever. Callers
+	// whose worktree outlives their process (zero worktrees prepare hands
+	// the path to an external owner) leave it zero for a persistent lock
+	// that only an explicit release clears.
+	LeasePID int
 }
 
 type Result struct {
@@ -128,7 +138,7 @@ func Prepare(ctx context.Context, options Options) (Result, error) {
 		// would edit the same tree, and whichever exits first would release
 		// the single Git lock out from under the other), so reject it rather
 		// than hand the second caller an unprotected shared workspace.
-		acquired, err := lockWorktree(ctx, runGit, repoRoot, target)
+		acquired, err := lockWorktree(ctx, runGit, repoRoot, target, options.LeasePID)
 		if err != nil {
 			return Result{}, err
 		}
@@ -161,7 +171,7 @@ func Prepare(ctx context.Context, options Options) (Result, error) {
 	// this call just created means another process raced us to it: treat that
 	// exactly like the reuse collision above rather than claiming a lease
 	// this call never acquired.
-	acquired, err := lockWorktree(ctx, runGit, repoRoot, target)
+	acquired, err := lockWorktree(ctx, runGit, repoRoot, target, options.LeasePID)
 	if err != nil {
 		return Result{}, err
 	}
@@ -172,12 +182,71 @@ func Prepare(ctx context.Context, options Options) (Result, error) {
 	return result, nil
 }
 
+// leaseReasonPrefix marks a lock Zero itself created (vs a human `git
+// worktree lock`); a "(pid N)" suffix makes the lease recoverable by Clean
+// once the owning process is gone.
+const leaseReasonPrefix = "zero: active task worktree"
+
+// leaseReason renders the lock reason for a Zero lease, embedding the owning
+// PID when the caller's worktree lifetime is bound to its process.
+func leaseReason(pid int) string {
+	if pid > 0 {
+		return fmt.Sprintf("%s (pid %d)", leaseReasonPrefix, pid)
+	}
+	return leaseReasonPrefix
+}
+
+// leasePID extracts the owning PID from a Zero lease reason. ok=false for
+// human locks and PID-less Zero leases (external prepare callers), which
+// only an explicit release may clear.
+func leasePID(reason string) (int, bool) {
+	rest, found := strings.CutPrefix(strings.TrimSpace(reason), leaseReasonPrefix+" (pid ")
+	if !found {
+		return 0, false
+	}
+	digits, found := strings.CutSuffix(rest, ")")
+	if !found {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(digits)
+	if err != nil || pid <= 0 {
+		return 0, false
+	}
+	return pid, true
+}
+
+// processAlive reports whether pid is a live process. It fails closed: any
+// ambiguity (permission denied, platform limits) counts as alive, so an
+// uncertain answer can only keep a lease, never expire one.
+func processAlive(pid int) bool {
+	if pid <= 0 {
+		return true
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		// Windows: FindProcess opens the process and fails when it is gone.
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return true
+	}
+	err = proc.Signal(syscall.Signal(0))
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, os.ErrProcessDone) {
+		return false
+	}
+	// EPERM: the process exists but belongs to another user.
+	return errors.Is(err, syscall.EPERM)
+}
+
 // lockWorktree takes the Clean-protection lease on target via `git worktree
 // lock`. It reports whether this call acquired the lease: a lock already held
 // by someone else is left in place and reported as not acquired, so the
 // caller knows the matching Release belongs to the lease's original owner.
-func lockWorktree(ctx context.Context, runGit GitRunner, repoRoot string, target string) (bool, error) {
-	lockResult, err := runGit(ctx, repoRoot, "worktree", "lock", "--reason", "zero: active task worktree", target)
+func lockWorktree(ctx context.Context, runGit GitRunner, repoRoot string, target string, pid int) (bool, error) {
+	lockResult, err := runGit(ctx, repoRoot, "worktree", "lock", "--reason", leaseReason(pid), target)
 	if err != nil {
 		return false, fmt.Errorf("lock git worktree: %w", err)
 	}
@@ -489,18 +558,27 @@ func Clean(ctx context.Context, options Options, maxAge time.Duration) error {
 	cutoff := time.Now().Add(-maxAge)
 	var lastErr error
 	for _, entry := range parseWorktreeList(output) {
-		// A worktree a caller has explicitly locked (git worktree lock) is
-		// never a prune candidate, regardless of its mtime.
-		if entry.locked {
-			continue
-		}
-
 		// Only prune worktrees zero created for this repository (i.e. inside
 		// repoDir), using a path-boundary-safe comparison so a sibling
 		// directory that merely shares repoDir as a string prefix (e.g.
 		// "<repoDir>-other") can't match.
 		if !isUnderDir(entry.path, repoDir) {
 			continue
+		}
+
+		// A locked worktree is never a prune candidate — with one recovery
+		// carve-out: a Zero lease whose recorded owner process is provably
+		// dead (SIGKILL, crash, power loss skipped the deferred release).
+		// Without it, an abnormal exit leaves the lock in place forever and
+		// Clean can never reclaim the disk. Human locks and PID-less Zero
+		// leases (external prepare callers) are always honored.
+		expiredLease := false
+		if entry.locked {
+			pid, ok := leasePID(entry.lockReason)
+			if !ok || processAlive(pid) {
+				continue
+			}
+			expiredLease = true
 		}
 
 		info, err := os.Stat(entry.path)
@@ -515,7 +593,13 @@ func Clean(ctx context.Context, options Options, maxAge time.Duration) error {
 		}
 
 		if worktreeIsStale(entry.path, cutoff) {
-			if worktreeIsDirty(ctx, runGit, entry.path) {
+			// An explicit release is the owner's completion signal, so a
+			// worktree holding only gitignored residue (node_modules, build
+			// output) after release is reclaimable — otherwise every released
+			// worktree with such artifacts leaks forever. An expired lease is
+			// NOT a completion signal (the task may have died mid-work), so
+			// there ignored files still count as live data.
+			if worktreeIsDirty(ctx, runGit, entry.path, expiredLease) {
 				// A stale mtime only means nothing changed at the worktree's
 				// top level or below recently; it does not mean the task
 				// holding it is done. Uncommitted or untracked changes are
@@ -527,6 +611,15 @@ func Clean(ctx context.Context, options Options, maxAge time.Duration) error {
 			if err := preserveUnreachableWorktreeHead(ctx, runGit, repoRoot, entry.path); err != nil {
 				lastErr = errors.Join(lastErr, fmt.Errorf("preserve worktree HEAD %s: %w", entry.path, err))
 				continue
+			}
+			if expiredLease {
+				// Recover the dead owner's lease only once every removal
+				// guard has passed, so a failed unlock (or a later guard)
+				// leaves the lock in place rather than half-recovered.
+				if _, err := gitOutput(ctx, runGit, repoRoot, "worktree", "unlock", entry.path); err != nil {
+					lastErr = errors.Join(lastErr, fmt.Errorf("recover expired lease %s: %w", entry.path, err))
+					continue
+				}
 			}
 			// gitOutput (not a raw runGit call) so a nonzero exit code is
 			// reported as a failure: defaultRunGit deliberately returns a nil
@@ -547,8 +640,9 @@ func Clean(ctx context.Context, options Options, maxAge time.Duration) error {
 }
 
 type worktreeEntry struct {
-	path   string
-	locked bool
+	path       string
+	locked     bool
+	lockReason string
 }
 
 // parseWorktreeList reads `git worktree list --porcelain` output into one
@@ -568,6 +662,7 @@ func parseWorktreeList(output string) []worktreeEntry {
 			current = &worktreeEntry{path: filepath.Clean(strings.TrimPrefix(line, "worktree "))}
 		case current != nil && (line == "locked" || strings.HasPrefix(line, "locked ")):
 			current.locked = true
+			current.lockReason = strings.TrimSpace(strings.TrimPrefix(line, "locked"))
 		}
 	}
 	if current != nil {
@@ -662,21 +757,29 @@ func worktreeIsStale(root string, cutoff time.Time) bool {
 	return stale && walkErr == nil
 }
 
-// worktreeIsDirty reports whether a worktree has uncommitted, untracked, or
-// ignored changes, via `git status --porcelain --ignored` run inside it. A
-// task can hold a worktree with live, unpushed work while it waits on a
-// model, network, or user for far longer than the staleness window, without
-// writing to the tree again in that time; mtime alone can't distinguish that
-// from an abandoned one, but a dirty working tree still can. --ignored is
-// included because files matched by .gitignore (credentials, generated
-// drafts, task artifacts) are real data a task can leave behind; without it,
-// plain `git status --porcelain` reports a worktree holding only such files
-// as clean, and Clean would force-remove it and silently discard them.
+// worktreeIsDirty reports whether a worktree has changes that block a forced
+// removal, via `git status --porcelain` run inside it. A task can hold a
+// worktree with live, unpushed work while it waits on a model, network, or
+// user for far longer than the staleness window, without writing to the tree
+// again in that time; mtime alone can't distinguish that from an abandoned
+// one, but a dirty working tree still can.
+//
+// includeIgnored additionally counts files matched by .gitignore
+// (credentials, generated drafts, task artifacts) as live data. It is set
+// when the worktree's owner never signaled completion (an expired crashed
+// lease): such files may be all a dead task left behind. It is clear for an
+// explicitly released worktree, where ignored residue like node_modules or
+// build output would otherwise make the released checkout unreclaimable at
+// every age — release is the owner's statement that the task is done.
 //
 // An inspection failure fails closed, treating it as dirty rather than clean:
 // an incomplete check must not authorize a forced removal.
-func worktreeIsDirty(ctx context.Context, runGit GitRunner, path string) bool {
-	output, err := gitOutput(ctx, runGit, path, "status", "--porcelain", "--ignored")
+func worktreeIsDirty(ctx context.Context, runGit GitRunner, path string, includeIgnored bool) bool {
+	args := []string{"status", "--porcelain"}
+	if includeIgnored {
+		args = append(args, "--ignored")
+	}
+	output, err := gitOutput(ctx, runGit, path, args...)
 	if err != nil {
 		return true
 	}

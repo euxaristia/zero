@@ -595,7 +595,7 @@ func TestCleanPrunesStaleWorktrees(t *testing.T) {
 	if runner.commandLine(1) != "git worktree list --porcelain" {
 		t.Errorf("call 1 = %q", runner.commandLine(1))
 	}
-	expectedStatusCall := "git status --porcelain --ignored"
+	expectedStatusCall := "git status --porcelain"
 	if runner.commandLine(2) != expectedStatusCall {
 		t.Errorf("call 2 = %q, want %q", runner.commandLine(2), expectedStatusCall)
 	}
@@ -936,7 +936,12 @@ func TestCleanPreservesUnreachableCommitBeforeRemoval(t *testing.T) {
 	}
 }
 
-func TestCleanSkipsWorktreeWithOnlyIgnoredFiles(t *testing.T) {
+func TestCleanReclaimsReleasedWorktreeWithOnlyIgnoredFiles(t *testing.T) {
+	// An explicit release is the owner's completion signal: an unlocked,
+	// stale worktree holding only gitignored residue (node_modules, build
+	// output) must be reclaimable, or every released worktree with such
+	// artifacts leaks disk forever. The dirty probe for unlocked entries
+	// therefore omits --ignored.
 	tempDir := t.TempDir()
 	baseDir := filepath.Join(tempDir, "zero-worktrees")
 	repoRoot := filepath.Join(tempDir, "repo")
@@ -958,8 +963,11 @@ func TestCleanSkipsWorktreeWithOnlyIgnoredFiles(t *testing.T) {
 		results: []CommandResult{
 			{Stdout: repoRoot},
 			{Stdout: "worktree " + ignoredOnlyPath + "\n"},
-			{Stdout: "!! ignored-data\n"}, // status --porcelain --ignored: ignored file present
-			{ExitCode: 0},                 // worktree prune
+			{ExitCode: 0},               // status --porcelain: ignored files invisible => clean
+			{Stdout: "deadbeef"},        // rev-parse HEAD
+			{Stdout: "refs/heads/main"}, // for-each-ref --contains (reachable)
+			{ExitCode: 0},               // worktree remove --force
+			{ExitCode: 0},               // worktree prune
 		},
 	}
 
@@ -967,17 +975,165 @@ func TestCleanSkipsWorktreeWithOnlyIgnoredFiles(t *testing.T) {
 		t.Fatalf("Clean failed: %v", err)
 	}
 
-	for i, call := range runner.calls {
-		if i == 2 {
-			want := "status --porcelain --ignored"
-			if got := strings.Join(call.args, " "); got != want {
-				t.Fatalf("status call args = %q, want %q", got, want)
-			}
-		}
-		if len(call.args) > 0 && call.args[0] == "remove" {
-			t.Fatalf("Clean removed a worktree with only ignored files: %v", call.args)
+	if got, want := runner.commandLine(2), "git status --porcelain"; got != want {
+		t.Fatalf("status call = %q, want %q (released worktrees must not count ignored residue)", got, want)
+	}
+	removed := false
+	for _, call := range runner.calls {
+		if len(call.args) > 1 && call.args[0] == "worktree" && call.args[1] == "remove" {
+			removed = true
 		}
 	}
+	if !removed {
+		t.Fatal("Clean did not reclaim a released, stale worktree holding only ignored residue")
+	}
+}
+
+// TestCleanRecoversExpiredLease: a Zero lease that records its owning PID is
+// recoverable — if that process died without releasing (SIGKILL, crash), the
+// lock must not protect the worktree forever. A stale, clean worktree behind
+// a dead-owner lease is unlocked and removed; the dirty probe there keeps
+// --ignored because a crashed task never signaled completion.
+func TestCleanRecoversExpiredLease(t *testing.T) {
+	deadPID := deadProcessPID(t)
+	tempDir := t.TempDir()
+	baseDir := filepath.Join(tempDir, "zero-worktrees")
+	repoRoot := filepath.Join(tempDir, "repo")
+	repoDir := filepath.Join(baseDir, "zero-worktree-"+repoKey(repoRoot))
+
+	crashedPath := filepath.Join(repoDir, "crashed-task")
+	if err := os.MkdirAll(crashedPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(repoRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	twoDaysAgo := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(crashedPath, twoDaysAgo, twoDaysAgo); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &fakeRunner{
+		results: []CommandResult{
+			{Stdout: repoRoot},
+			{Stdout: "worktree " + crashedPath + "\nlocked " + leaseReason(deadPID) + "\n"},
+			{ExitCode: 0},               // status --porcelain --ignored: clean
+			{Stdout: "deadbeef"},        // rev-parse HEAD
+			{Stdout: "refs/heads/main"}, // for-each-ref --contains (reachable)
+			{ExitCode: 0},               // worktree unlock (lease recovery)
+			{ExitCode: 0},               // worktree remove --force
+			{ExitCode: 0},               // worktree prune
+		},
+	}
+
+	if err := Clean(context.Background(), Options{Cwd: repoRoot, BaseDir: baseDir, RunGit: runner.Run}, 24*time.Hour); err != nil {
+		t.Fatalf("Clean failed: %v", err)
+	}
+
+	if got, want := runner.commandLine(2), "git status --porcelain --ignored"; got != want {
+		t.Fatalf("status call = %q, want %q (a crashed lease never signaled completion)", got, want)
+	}
+	if got, want := runner.commandLine(5), "git worktree unlock "+filepath.Clean(crashedPath); got != want {
+		t.Fatalf("call 5 = %q, want lease recovery %q", got, want)
+	}
+	if got, want := runner.commandLine(6), "git worktree remove --force "+filepath.Clean(crashedPath); got != want {
+		t.Fatalf("call 6 = %q, want %q", got, want)
+	}
+}
+
+// TestCleanSkipsExpiredLeaseWithIgnoredData: even behind a dead-owner lease,
+// ignored files (credentials, generated drafts) may be all the crashed task
+// left behind, so they still block removal.
+func TestCleanSkipsExpiredLeaseWithIgnoredData(t *testing.T) {
+	deadPID := deadProcessPID(t)
+	tempDir := t.TempDir()
+	baseDir := filepath.Join(tempDir, "zero-worktrees")
+	repoRoot := filepath.Join(tempDir, "repo")
+	repoDir := filepath.Join(baseDir, "zero-worktree-"+repoKey(repoRoot))
+
+	crashedPath := filepath.Join(repoDir, "crashed-task")
+	if err := os.MkdirAll(crashedPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(repoRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	twoDaysAgo := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(crashedPath, twoDaysAgo, twoDaysAgo); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &fakeRunner{
+		results: []CommandResult{
+			{Stdout: repoRoot},
+			{Stdout: "worktree " + crashedPath + "\nlocked " + leaseReason(deadPID) + "\n"},
+			{Stdout: "!! ignored-data\n"}, // status --porcelain --ignored
+			{ExitCode: 0},                 // worktree prune
+		},
+	}
+
+	if err := Clean(context.Background(), Options{Cwd: repoRoot, BaseDir: baseDir, RunGit: runner.Run}, 24*time.Hour); err != nil {
+		t.Fatalf("Clean failed: %v", err)
+	}
+	for _, call := range runner.calls {
+		if len(call.args) > 1 && call.args[0] == "worktree" && (call.args[1] == "remove" || call.args[1] == "unlock") {
+			t.Fatalf("Clean touched a crashed worktree holding ignored data: %v", call.args)
+		}
+	}
+}
+
+// TestCleanHonorsLiveLease: a lease whose recorded owner is still running is
+// never expired, regardless of staleness.
+func TestCleanHonorsLiveLease(t *testing.T) {
+	tempDir := t.TempDir()
+	baseDir := filepath.Join(tempDir, "zero-worktrees")
+	repoRoot := filepath.Join(tempDir, "repo")
+	repoDir := filepath.Join(baseDir, "zero-worktree-"+repoKey(repoRoot))
+
+	livePath := filepath.Join(repoDir, "live-task")
+	if err := os.MkdirAll(livePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(repoRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	twoDaysAgo := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(livePath, twoDaysAgo, twoDaysAgo); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &fakeRunner{
+		results: []CommandResult{
+			{Stdout: repoRoot},
+			{Stdout: "worktree " + livePath + "\nlocked " + leaseReason(os.Getpid()) + "\n"},
+			{ExitCode: 0}, // worktree prune
+		},
+	}
+
+	if err := Clean(context.Background(), Options{Cwd: repoRoot, BaseDir: baseDir, RunGit: runner.Run}, 24*time.Hour); err != nil {
+		t.Fatalf("Clean failed: %v", err)
+	}
+	for _, call := range runner.calls {
+		if len(call.args) > 0 && (call.args[0] == "remove" || call.args[0] == "status") {
+			t.Fatalf("Clean touched a worktree behind a live lease: %v", call.args)
+		}
+	}
+}
+
+// deadProcessPID returns the PID of a process that has already exited, for
+// exercising lease expiry. PID reuse in the instant between exit and the
+// assertion is vanishingly unlikely.
+func deadProcessPID(t *testing.T) int {
+	t.Helper()
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not available")
+	}
+	cmd := exec.Command(gitPath, "version")
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("run git version: %v", err)
+	}
+	return cmd.Process.Pid
 }
 
 // worktreeIsDirty must count files matched by .gitignore as dirty content: a
@@ -1007,7 +1163,7 @@ func TestWorktreeIsDirtyCountsIgnoredFilesAsDirty(t *testing.T) {
 	run("add", ".gitignore")
 	run("commit", "--quiet", "-m", "initial")
 
-	if worktreeIsDirty(context.Background(), defaultRunGit, dir) {
+	if worktreeIsDirty(context.Background(), defaultRunGit, dir, true) {
 		t.Fatal("expected a clean worktree with no ignored files present to report clean")
 	}
 
@@ -1015,7 +1171,7 @@ func TestWorktreeIsDirtyCountsIgnoredFilesAsDirty(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !worktreeIsDirty(context.Background(), defaultRunGit, dir) {
+	if !worktreeIsDirty(context.Background(), defaultRunGit, dir, true) {
 		t.Fatal("expected an ignored-but-present file to count as dirty")
 	}
 }
@@ -1149,7 +1305,7 @@ func TestCleanSkipsDirtyStaleWorktree(t *testing.T) {
 // authorize a forced removal.
 func TestWorktreeIsDirtyFailsClosedOnInspectionError(t *testing.T) {
 	runner := &fakeRunner{results: []CommandResult{{ExitCode: 1, Stderr: "fatal: not a git repository"}}}
-	if !worktreeIsDirty(context.Background(), runner.Run, t.TempDir()) {
+	if !worktreeIsDirty(context.Background(), runner.Run, t.TempDir(), true) {
 		t.Fatal("expected worktreeIsDirty to fail closed on a status error")
 	}
 }

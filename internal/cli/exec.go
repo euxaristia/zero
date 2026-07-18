@@ -199,6 +199,11 @@ func runExec(args []string, stdout io.Writer, stderr io.Writer, deps appDeps) in
 			Name:    options.worktreeName,
 			BaseDir: options.worktreeDir,
 			Now:     deps.now,
+			// The worktree's lifetime is bound to this process (the deferred
+			// release below), so record the PID: if this process dies without
+			// releasing, Clean can expire the lease instead of skipping the
+			// locked worktree forever.
+			LeasePID: os.Getpid(),
 		})
 		if err != nil {
 			return writeExecFormatUsageError(stdout, stderr, options.outputFormat, err.Error())
