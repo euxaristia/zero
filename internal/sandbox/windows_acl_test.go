@@ -238,6 +238,62 @@ func TestBuildWindowsACLPlanMarksSharedDenyPathsForDescendantScan(t *testing.T) 
 	}
 }
 
+// TestBuildWindowsACLPlanSkipsSharedDenyPathNestedUnderWriteRoot pins the fix
+// for a shared-path deny landing on a configured write root's own descendant:
+// if a workspace's write root is (or contains) one of the four shared paths —
+// here C:\Users contains the Public shared path — a DenyWrite there would sit
+// ahead of that root's Allow for every broadened token and win under Windows'
+// deny-before-allow evaluation, jailing a directory the user explicitly
+// configured as writable. Only the shared paths NOT nested under any
+// configured write root should get the compensating deny.
+func TestBuildWindowsACLPlanSkipsSharedDenyPathNestedUnderWriteRoot(t *testing.T) {
+	home := t.TempDir()
+	systemDrive, systemRoot, programData, publicDir := windowsSharedDenyPathsForTest(t)
+	// publicDir is a Windows-style path (backslash-separated) even when this
+	// test runs on Linux/macOS, so its parent must be computed with a literal
+	// backslash split, not filepath.Dir (which uses the native separator and
+	// would treat the whole string as one component on non-Windows GOOS).
+	lastSeparator := strings.LastIndex(publicDir, `\`)
+	if lastSeparator <= 0 {
+		t.Fatalf("test fixture assumes publicDir %q has a parent reachable via a backslash split", publicDir)
+	}
+	usersRoot := publicDir[:lastSeparator]
+	plan, err := BuildWindowsACLPlan(WindowsSandboxCommandConfig{
+		SandboxHome:    home,
+		WorkspaceRoots: []string{usersRoot},
+		SandboxLevel:   WindowsSandboxLevelRestrictedToken,
+		PermissionProfile: PermissionProfile{
+			FileSystem: FileSystemPolicy{
+				Kind:       FileSystemRestricted,
+				WriteRoots: []WritableRoot{{Root: usersRoot}},
+				DenyRead:   []string{`C:\workspace\secret-read`},
+			},
+			Network: NetworkPolicy{Mode: NetworkDeny},
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildWindowsACLPlan: %v", err)
+	}
+	for _, entry := range plan.Entries {
+		if entry.Action == WindowsACLDenyWrite && windowsCapabilityPathKey(entry.Path) == windowsCapabilityPathKey(publicDir) {
+			t.Fatalf("plan denies write on %q, which is nested under configured write root %q: %#v", publicDir, usersRoot, entry)
+		}
+	}
+	// The other three shared paths are untouched by this write root and must
+	// still get their compensating deny.
+	for _, path := range []string{systemDrive + `\`, programData, systemRoot + `\Temp`} {
+		found := false
+		for _, entry := range plan.Entries {
+			if entry.Action == WindowsACLDenyWrite && windowsCapabilityPathKey(entry.Path) == windowsCapabilityPathKey(path) {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("plan = %#v, want shared path %q still denied (unaffected by the %q write root)", plan.Entries, path, usersRoot)
+		}
+	}
+}
+
 func TestBuildWindowsACLPlanRejectsUnrestrictedProfiles(t *testing.T) {
 	_, err := BuildWindowsACLPlan(WindowsSandboxCommandConfig{
 		SandboxHome: t.TempDir(),
