@@ -377,11 +377,13 @@ go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
 go install golang.org/x/vuln/cmd/govulncheck@v1.3.0
 ```
 
-The installed binaries land in `$GOPATH/bin` (default `~/go/bin`), which must be on
-your `PATH` to run them directly. If it isn't, add it:
+The installed binaries land in `$GOBIN` when it is set, otherwise in
+`$GOPATH/bin` (default `~/go/bin`). That directory must be on your `PATH` to
+run them directly. If it isn't, add it:
 
 ```bash
-export PATH="$PATH:$(go env GOPATH)/bin"
+gobin="$(go env GOBIN)"; [ -z "$gobin" ] && gobin="$(go env GOPATH)/bin"
+case ":$PATH:" in *":$gobin:"*) ;; *) export PATH="$PATH:$gobin" ;; esac
 ```
 
 ### Cross-Compile Examples
