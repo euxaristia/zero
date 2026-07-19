@@ -22,48 +22,41 @@ import (
 // a write outside every configured write root. This file enumerates those
 // existing writable descendants and denies each one directly.
 //
-// The scan is deliberately bounded and targeted, NOT a blanket recursive walk:
-// stamping an inheritable deny (or rewriting every descendant's ACL) across the
-// system drive is the exact slow/brittle/ACL-polluting pathology the
-// inheritable-deny approach was rejected for. Instead the traversal only ever
-// WRITES a deny to a descendant it has confirmed is already writable by those
-// broad groups, and it prunes the enormous non-writable system trees
-// (C:\Windows, C:\Program Files) so cost stays bounded:
+// Coverage rules (fail closed):
 //
-//   - It always descends the first windowsDescendantScanBaselineDepth levels,
-//     so a shallow, freshly installed writable directory is caught even when its
-//     parent is not itself writable.
-//   - Below the baseline it descends ONLY into a directory that is itself
-//     writable by the broad groups. A writable subtree is the real escape
-//     surface and is small in practice, while a non-writable directory cannot
-//     have been reached by such a write and so is pruned.
-//   - windowsDescendantScanMaxDepth and windowsDescendantScanMaxDirs are hard
-//     safety caps against a pathological deep or very broad writable tree. The
-//     scan fails closed if either is hit: unlike a locked-down directory (see
-//     below), hitting a cap means there IS unexamined territory, so reporting
-//     success would certify an incomplete scan as clean.
-//   - A directory this admin-elevated process cannot list, or whose DACL it
-//     cannot read, is treated as locked down and pruned (not failed closed).
-//     This is deliberate, not a residual gap: every one of the four shared
-//     roots has real, common subdirectories Administrators are denied by
-//     design regardless of privilege — "C:\System Volume Information" is
-//     SYSTEM-exclusive on every NTFS volume (see Microsoft KB2867841) and
-//     sits directly under the system drive root scanned here. Failing closed
-//     on that ubiquitous, expected case would make `zero sandbox setup` fail
-//     on every real machine, not just pathological ones. A directory the
-//     elevated process cannot even open a handle to, or read the DACL of,
-//     cannot have granted BUILTIN\Users or Authenticated Users write either
-//     (that would require WRITE_DAC/READ_CONTROL to be broader than what this
-//     process — running as Administrator — already has), so pruning it here
-//     carries no realistic write-jail risk.
+//   - Every directory under a shared root is considered for descent within the
+//     depth/entry caps, whether or not the parent itself is Users-writable. A
+//     depth-N writable child under non-writable ancestors is a real escape and
+//     must be found (see CodeRabbit/jatmn review).
+//   - Hitting windowsDescendantScanMaxDepth or windowsDescendantScanMaxDirs
+//     means unexamined territory remains: the scan returns an error so setup
+//     and pre-broaden revalidation cannot certify a partial walk as clean.
+//   - Reparse points (junctions, symlinks, volume mount points) are fail-closed:
+//     sandboxed access can follow them, but denying/descending them risks
+//     touching unrelated trees or other volumes. Incomplete coverage of a
+//     reparse target aborts broadening rather than pretending the tree is safe.
+//   - A directory this process cannot list, or a child whose DACL it cannot
+//     read, is fail-closed UNLESS the basename is a known SYSTEM-exclusive
+//     Windows directory (e.g. "System Volume Information") that is present on
+//     every volume and never grants Users/Authenticated Users write. Without
+//     that narrow allowlist, elevated setup would fail on every real machine.
+//   - Stock non-writable system trees under the drive root (Windows, Program
+//     Files, ...) are pruned by basename only when the probe says they are not
+//     Users/AuthUsers-writable. That keeps the C:\ walk from exhausting the
+//     entry budget on trees that are not the write-jail surface; if such a
+//     tree IS Users-writable it is denied and descended like any other.
 //
-// Reparse points (junctions/symlinks) are skipped entirely: their target lives
-// outside this subtree, so denying or descending them would touch unrelated
-// objects and risk traversal loops.
-const (
-	windowsDescendantScanBaselineDepth = 2
-	windowsDescendantScanMaxDepth      = 24
-	windowsDescendantScanMaxDirs       = 8192
+// Staleness: setup alone is not enough. Non-inheriting denies only cover the
+// filesystem state at apply time. The elevated command runner revalidates and
+// reapplies this scan immediately before broadening the restricted token
+// (windowsEnsureSharedDescendantCoverage); if coverage cannot be re-established,
+// the token stays on the narrow SID set.
+//
+// Basename policies live in windows_acl_descendants.go so non-Windows tests can
+// pin them without Win32. Bounds are vars so Windows tests can lower them.
+var (
+	windowsDescendantScanMaxDepth = 24
+	windowsDescendantScanMaxDirs  = 8192
 )
 
 // windowsBroadenedWriteProbeMask is the set of access-mask bits that let a
@@ -88,9 +81,10 @@ const windowsBroadenedWriteProbeMask windows.ACCESS_MASK = windows.FILE_WRITE_DA
 // to each. It returns every snapshot it applied (including on error) so the
 // caller can roll the whole apply back. A descendant it identified as writable
 // but could not deny is a hole it cannot close, so that failure is returned
-// (fail closed); a descendant whose parent it merely could not list or whose
-// DACL it could not read is treated as locked-down and skipped in the
-// enumeration itself (see windowsEnumerateWritableDescendants).
+// (fail closed). An incomplete enumeration (caps, reparse, unreadable child)
+// is also returned as an error. Descendants that already carry an equivalent
+// deny for denySID are left untouched so setup reruns and command-time
+// revalidation do not accumulate duplicate permanent ACEs.
 func applyWindowsSharedDescendantDenies(root, denySID string, writeRoots []string) ([]windowsACLSnapshot, error) {
 	descendants, err := windowsEnumerateWritableDescendants(root, writeRoots)
 	if err != nil {
@@ -98,6 +92,13 @@ func applyWindowsSharedDescendantDenies(root, denySID string, writeRoots []strin
 	}
 	snapshots := make([]windowsACLSnapshot, 0, len(descendants))
 	for _, dir := range descendants {
+		denied, err := windowsPathDeniesCapabilitySID(dir, denySID)
+		if err != nil {
+			return snapshots, fmt.Errorf("inspect existing deny on %s: %w", dir, err)
+		}
+		if denied {
+			continue
+		}
 		snapshot, applied, err := applyWindowsACLPathGroup(windowsACLPathGroup{
 			Path: dir,
 			Entries: []WindowsACLEntry{{
@@ -123,16 +124,11 @@ func applyWindowsSharedDescendantDenies(root, denySID string, writeRoots []strin
 // legitimate workspace writes are never jailed. Files are checked and denied
 // just like directories — a writable file directly under a shared root is as
 // much an escape surface as a writable directory — but only directories are
-// descended into. See the package-level comment above for the traversal
-// bounds and their rationale.
+// descended into.
 //
-// The scan fails closed on exhausting windowsDescendantScanMaxDirs or
-// windowsDescendantScanMaxDepth: either means there is unexamined territory
-// this call cannot vouch for, so it returns an error rather than a partial
-// result the caller could mistake for a complete one. A directory it cannot
-// list, or a child whose DACL it cannot read, is treated as locked down and
-// pruned instead — see the package-level comment for why that case is safe
-// to skip rather than fail closed.
+// Fail closed: exhausting the depth or entry caps, encountering a reparse
+// point, or failing to list/inspect a non-allowlisted entry returns an error
+// rather than a partial success the caller could mistake for complete coverage.
 func windowsEnumerateWritableDescendants(root string, writeRoots []string) ([]string, error) {
 	if windowsCapabilityPathKey(root) == "" {
 		return nil, nil
@@ -164,13 +160,10 @@ func windowsEnumerateWritableDescendants(root string, writeRoots []string) ([]st
 		queue = queue[1:]
 		entries, err := os.ReadDir(current.path)
 		if err != nil {
-			// A directory the elevated setup cannot even list is locked down
-			// (SYSTEM-owned, e.g. "System Volume Information" on every shared
-			// root's own volume); the broad groups cannot write there either,
-			// so skipping it is safe. Traversal is best-effort so a full
-			// system-drive walk does not abort setup on the normal
-			// un-listable system dirs it must step over.
-			continue
+			if windowsDescendantScanNameIsSystemLocked(filepath.Base(current.path)) {
+				continue
+			}
+			return nil, fmt.Errorf("list descendants of %s: %w", current.path, err)
 		}
 		for _, entry := range entries {
 			child := filepath.Join(current.path, entry.Name())
@@ -179,7 +172,7 @@ func windowsEnumerateWritableDescendants(root string, writeRoots []string) ([]st
 				continue
 			}
 			if windowsPathIsReparsePoint(child) {
-				continue
+				return nil, fmt.Errorf("descendant scan hit reparse point %s under %s; cannot establish coverage for its target", child, root)
 			}
 			if visited >= windowsDescendantScanMaxDirs {
 				return nil, fmt.Errorf("descendant scan exceeded %d entries below %s", windowsDescendantScanMaxDirs, root)
@@ -187,25 +180,34 @@ func windowsEnumerateWritableDescendants(root string, writeRoots []string) ([]st
 			visited++
 			writable, err := windowsDirGrantsBroadenedWrite(child)
 			if err != nil {
-				// Cannot read the child's DACL: same reasoning as an un-listable
-				// directory: locked down, not an escape target. Skip.
-				continue
+				if windowsDescendantScanNameIsSystemLocked(entry.Name()) {
+					continue
+				}
+				return nil, fmt.Errorf("inspect DACL of %s: %w", child, err)
 			}
 			if writable {
 				out = append(out, child)
 			}
 			if !entry.IsDir() {
-				// A file has no descendants to walk; it either got denied above
-				// or was not writable, either way there is nothing further to do.
 				continue
 			}
 			childDepth := current.depth + 1
-			if childDepth < windowsDescendantScanBaselineDepth || writable {
-				if childDepth >= windowsDescendantScanMaxDepth {
-					return nil, fmt.Errorf("descendant scan exceeded depth %d at %s", windowsDescendantScanMaxDepth, child)
-				}
-				queue = append(queue, node{path: child, depth: childDepth})
+			if childDepth >= windowsDescendantScanMaxDepth {
+				// A directory at the depth cap may still have unexamined
+				// children. Fail closed rather than pretend the subtree is clean.
+				// Leaf files at this depth were already inspected above.
+				// Only fail when we would have needed to descend further: always
+				// report the cap so callers cannot certify "complete".
+				return nil, fmt.Errorf("descendant scan exceeded depth %d at %s", windowsDescendantScanMaxDepth, child)
 			}
+			// Always descend (subject to caps), including through non-writable
+			// ancestors, so a deep writable child is not missed. Stock huge
+			// non-writable system trees are pruned by basename only when the
+			// probe confirmed they are not Users/AuthUsers-writable.
+			if !writable && windowsDescendantScanNameIsPruned(entry.Name()) {
+				continue
+			}
+			queue = append(queue, node{path: child, depth: childDepth})
 		}
 	}
 	return out, nil
@@ -267,6 +269,11 @@ func windowsAceSID(ace *windows.ACCESS_ALLOWED_ACE) (sid *windows.SID, ok bool) 
 // honoring a deny ACE that precedes an allow for the same bits, the canonical
 // evaluation. A NULL DACL grants everyone full access and is treated as
 // writable.
+//
+// Note: this is a deliberate DACL walk rather than AccessCheck. It must detect
+// grants that would become usable once the restricted token is broadened with
+// those groups, independent of the setup process's own token. INHERIT_ONLY ACEs
+// are skipped because they do not apply to the object itself.
 func windowsDirGrantsBroadenedWrite(path string) (bool, error) {
 	// GetNamedSecurityInfo returns a self-relative descriptor copied onto the Go
 	// heap (it LocalFrees the Win32 allocation itself), so it must NOT be
@@ -332,4 +339,103 @@ func windowsPathIsReparsePoint(path string) bool {
 		return false
 	}
 	return attrs&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+// windowsEnsureSharedDescendantCoverage re-enumerates the shared deny roots and
+// ensures every currently Users/AuthUsers-writable descendant carries a direct
+// DenyWrite for the stable read-only capability SID. It is called immediately
+// before a command broadens the restricted token so a child created after
+// `zero sandbox setup` cannot remain an uncovered write-jail escape.
+//
+// Prefer reapplying denies (same permanent posture as elevated setup). When
+// reapply fails — typically because the command process lacks WRITE_DAC on a
+// system path — fall back to a read-only hole check: if any writable
+// descendant still lacks the synthetic deny, coverage is incomplete and the
+// caller must not broaden. Fail closed on enumeration errors either way.
+func windowsEnsureSharedDescendantCoverage(config WindowsSandboxCommandConfig) error {
+	plan, err := BuildWindowsACLPlan(config)
+	if err != nil {
+		return err
+	}
+	writeRoots := windowsPlanAllowWriteRoots(plan)
+	for _, group := range groupWindowsACLPlanByPath(plan) {
+		denySID, ok := windowsGroupScanDescendantsSID(group)
+		if !ok {
+			continue
+		}
+		if _, err := os.Stat(group.Path); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("stat shared deny root %s: %w", group.Path, err)
+		}
+		if _, err := applyWindowsSharedDescendantDenies(group.Path, denySID, writeRoots); err == nil {
+			continue
+		} else if holes, holeErr := windowsUncoveredWritableDescendants(group.Path, denySID, writeRoots); holeErr != nil {
+			return holeErr
+		} else if len(holes) > 0 {
+			return fmt.Errorf("shared descendant write coverage incomplete under %s (e.g. %s): %w", group.Path, holes[0], err)
+		}
+		// Reapply failed but every currently writable descendant already carries
+		// the synthetic deny, so the write jail still holds for this root.
+	}
+	return nil
+}
+
+// windowsUncoveredWritableDescendants returns Users/AuthUsers-writable
+// descendants of root that do not yet carry a DenyWrite ACE for denySID.
+func windowsUncoveredWritableDescendants(root, denySID string, writeRoots []string) ([]string, error) {
+	descendants, err := windowsEnumerateWritableDescendants(root, writeRoots)
+	if err != nil {
+		return nil, fmt.Errorf("enumerate writable descendants of %s: %w", root, err)
+	}
+	var holes []string
+	for _, dir := range descendants {
+		denied, err := windowsPathDeniesCapabilitySID(dir, denySID)
+		if err != nil {
+			return nil, fmt.Errorf("inspect existing deny on %s: %w", dir, err)
+		}
+		if !denied {
+			holes = append(holes, dir)
+		}
+	}
+	return holes, nil
+}
+
+// windowsPathDeniesCapabilitySID reports whether path's DACL already contains
+// a deny ACE naming the given capability SID string (the synthetic identity
+// used for shared-root / descendant DenyWrite entries).
+func windowsPathDeniesCapabilitySID(path, wantSID string) (bool, error) {
+	want, err := windows.StringToSid(wantSID)
+	if err != nil {
+		return false, fmt.Errorf("parse capability SID %q: %w", wantSID, err)
+	}
+	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		return false, err
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		return false, err
+	}
+	if dacl == nil {
+		return false, nil
+	}
+	for index := uint16(0); index < dacl.AceCount; index++ {
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if err := windows.GetAce(dacl, uint32(index), &ace); err != nil {
+			return false, fmt.Errorf("read ACE %d of %s: %w", index, path, err)
+		}
+		if ace.Header.AceType != windows.ACCESS_DENIED_ACE_TYPE && ace.Header.AceType != windowsAccessDeniedObjectAceType {
+			continue
+		}
+		sid, ok := windowsAceSID(ace)
+		if !ok {
+			continue
+		}
+		if sid.Equals(want) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
