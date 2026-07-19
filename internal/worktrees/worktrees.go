@@ -15,7 +15,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -217,28 +216,16 @@ func leasePID(reason string) (int, bool) {
 
 // processAlive reports whether pid is a live process. It fails closed: any
 // ambiguity (permission denied, platform limits) counts as alive, so an
-// uncertain answer can only keep a lease, never expire one.
+// uncertain answer can only keep a lease, never expire one. Detection is
+// platform-specific (see osProcessAlive in worktrees_posix.go /
+// worktrees_windows.go): os.FindProcess alone cannot tell a dead PID from a
+// live one on Windows, since OpenProcess can still succeed for a process that
+// has already exited but whose handle has not been fully released.
 func processAlive(pid int) bool {
 	if pid <= 0 {
 		return true
 	}
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		// Windows: FindProcess opens the process and fails when it is gone.
-		return false
-	}
-	if runtime.GOOS == "windows" {
-		return true
-	}
-	err = proc.Signal(syscall.Signal(0))
-	if err == nil {
-		return true
-	}
-	if errors.Is(err, os.ErrProcessDone) {
-		return false
-	}
-	// EPERM: the process exists but belongs to another user.
-	return errors.Is(err, syscall.EPERM)
+	return osProcessAlive(pid)
 }
 
 // lockWorktree takes the Clean-protection lease on target via `git worktree
@@ -297,26 +284,32 @@ func Release(ctx context.Context, options Options, path string) error {
 }
 
 // verifyZeroOwnedWorktree confirms path has a zero-worktree-<repoKey> ancestor
-// directory component, so Release cannot be used to clear the lock on a
-// worktree a user (or another tool) manages by hand: the command is
+// directory component, and that if git currently has it locked, the lock
+// reason is one Zero itself set, so Release cannot be used to clear the lock
+// on a worktree a user (or another tool) manages by hand: the command is
 // documented as releasing a worktree `prepare` created, not an arbitrary git
-// worktree lock. This checks for the ancestor component itself rather than
-// reconstructing and comparing a full repoDir, because Release has no
-// reliable way to know which --dir a long-gone Prepare call used (the CLI
-// never threads BaseDir through to Release, and a custom --dir is not
-// recorded anywhere the lock/unlock path can read back); the repoKey
-// component is Prepare's actual ownership signature regardless of which
-// directory it was created under. gitCommonDir resolves the shared .git
-// directory whether dir is the worktree itself or the main repository, so
-// this needs no branching on which of Release's two cwd cases is in play;
-// its parent is the same repoRoot Prepare/Clean use to compute repoKey.
+// worktree lock. The ancestor-component check stands in for reconstructing
+// and comparing a full repoDir, because Release has no reliable way to know
+// which --dir a long-gone Prepare call used (the CLI never threads BaseDir
+// through to Release, and a custom --dir is not recorded anywhere the
+// lock/unlock path can read back); the repoKey component is Prepare's actual
+// ownership signature regardless of which directory it was created under.
+// The repository root for that key, and the lock reason for the ownership
+// check, both come from the same `git worktree list --porcelain` call, which
+// works whether dir is the worktree itself or the main repository (its first
+// entry is always the main working tree, from any worktree, regardless of
+// git-dir layout), so this needs no branching on which of Release's two cwd
+// cases is in play.
 func verifyZeroOwnedWorktree(ctx context.Context, runGit GitRunner, dir string, path string) error {
-	commonDir, err := gitCommonDir(ctx, runGit, dir)
+	output, err := gitOutput(ctx, runGit, dir, "worktree", "list", "--porcelain")
 	if err != nil {
 		return fmt.Errorf("resolve repository for %s: %w", path, err)
 	}
-	repoRoot := filepath.Dir(commonDir)
-	want := "zero-worktree-" + repoKey(repoRoot)
+	entries := parseWorktreeList(output)
+	if len(entries) == 0 {
+		return fmt.Errorf("resolve repository for %s: git worktree list returned no entries", path)
+	}
+	want := "zero-worktree-" + repoKey(entries[0].path)
 
 	target := path
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
@@ -324,12 +317,29 @@ func verifyZeroOwnedWorktree(ctx context.Context, runGit GitRunner, dir string, 
 	} else if abs, err := filepath.Abs(path); err == nil {
 		target = abs
 	}
-	for _, component := range strings.Split(filepath.Clean(target), string(filepath.Separator)) {
+	target = filepath.Clean(target)
+
+	hasZeroComponent := false
+	for _, component := range strings.Split(target, string(filepath.Separator)) {
 		if component == want {
-			return nil
+			hasZeroComponent = true
+			break
 		}
 	}
-	return fmt.Errorf("refusing to release %s: not a zero-managed worktree (expected an ancestor directory named %q)", path, want)
+	if !hasZeroComponent {
+		return fmt.Errorf("refusing to release %s: not a zero-managed worktree (expected an ancestor directory named %q)", path, want)
+	}
+
+	for _, entry := range entries {
+		if entry.path != target {
+			continue
+		}
+		if entry.locked && !strings.HasPrefix(entry.lockReason, leaseReasonPrefix) {
+			return fmt.Errorf("refusing to release %s: locked with reason %q, not a zero lease", path, entry.lockReason)
+		}
+		break
+	}
+	return nil
 }
 
 func DefaultBaseDir(env map[string]string) (string, error) {

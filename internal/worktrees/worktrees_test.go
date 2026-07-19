@@ -91,20 +91,27 @@ func TestPrepareCreatesDetachedGitWorktree(t *testing.T) {
 }
 
 func TestReleaseUnlocksWorktree(t *testing.T) {
-	repoRoot := t.TempDir()
-	// gitCommonDir resolves its answer with EvalSymlinks, so the fake
-	// --git-common-dir response needs a real directory behind it.
-	if err := os.MkdirAll(filepath.Join(repoRoot, ".git"), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	// repoRoot must be resolved to its physical spelling up front: on a
+	// platform where the temp dir is itself a symlink (macOS /var ->
+	// /private/var), real `git worktree list --porcelain` reports the
+	// physical spelling, so computing repoKey from the lexical spelling here
+	// would produce a different key than verifyZeroOwnedWorktree derives in
+	// production, and Release would reject this genuinely Zero-owned fixture
+	// as not-zero-managed.
+	repoRoot := physicalTestPath(t, t.TempDir())
 	// path must carry the zero-worktree-<repoKey> ancestor component Prepare
 	// actually creates: Release now refuses to unlock anything else.
 	path := filepath.Join(t.TempDir(), "zero-worktree-"+repoKey(repoRoot), "task-a")
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	// The target entry carries Zero's own lease reason (as Prepare's lock
+	// call sets it), so the lock-reason check added alongside the ancestor
+	// check must let this release through rather than treating every locked
+	// entry as a manual, non-zero lock (see
+	// TestReleaseRejectsManuallyLockedWorktree for the rejecting case).
 	runner := &fakeRunner{results: []CommandResult{
-		{Stdout: filepath.Join(repoRoot, ".git") + "\n"},
+		{Stdout: "worktree " + repoRoot + "\nworktree " + path + "\nlocked " + leaseReasonPrefix + "\n"},
 		{},
 	}}
 
@@ -114,7 +121,7 @@ func TestReleaseUnlocksWorktree(t *testing.T) {
 	if len(runner.calls) != 2 {
 		t.Fatalf("expected exactly two git calls (ownership check, then unlock), got %#v", runner.calls)
 	}
-	if got := runner.commandLine(0); got != "git rev-parse --git-common-dir" {
+	if got := runner.commandLine(0); got != "git worktree list --porcelain" {
 		t.Fatalf("ownership-check command = %q", got)
 	}
 	if runner.calls[1].dir != path {
@@ -130,13 +137,15 @@ func TestReleaseFallsBackToCwdWhenWorktreeDirMissing(t *testing.T) {
 	// releasing it first leaves path itself gone; Release must still be able
 	// to run `git worktree unlock` (from the main repo, via options.Cwd) so
 	// the orphaned lock can be cleared and the entry later pruned.
-	repoRoot := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(repoRoot, ".git"), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	// repoRoot is resolved to its physical spelling for the same reason as
+	// TestReleaseUnlocksWorktree: real `git worktree list --porcelain`
+	// reports the physical spelling, so a lexical temp-dir spelling here
+	// would derive a different repoKey than production and reject this
+	// fixture.
+	repoRoot := physicalTestPath(t, t.TempDir())
 	missingPath := filepath.Join(t.TempDir(), "zero-worktree-"+repoKey(repoRoot), "already-deleted")
 	runner := &fakeRunner{results: []CommandResult{
-		{Stdout: filepath.Join(repoRoot, ".git") + "\n"},
+		{Stdout: "worktree " + repoRoot + "\n"},
 		{},
 	}}
 
@@ -161,20 +170,42 @@ func TestReleaseFallsBackToCwdWhenWorktreeDirMissing(t *testing.T) {
 // ancestor component must be refused before any unlock is attempted.
 func TestReleaseRejectsNonZeroOwnedWorktree(t *testing.T) {
 	repoRoot := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(repoRoot, ".git"), 0o700); err != nil {
-		t.Fatal(err)
-	}
 	manualWorktree := filepath.Join(t.TempDir(), "my-manual-worktree")
 	if err := os.MkdirAll(manualWorktree, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	runner := &fakeRunner{results: []CommandResult{
-		{Stdout: filepath.Join(repoRoot, ".git") + "\n"},
+		{Stdout: "worktree " + repoRoot + "\n"},
 	}}
 
 	err := Release(context.Background(), Options{RunGit: runner.Run}, manualWorktree)
 	if err == nil || !strings.Contains(err.Error(), "not a zero-managed worktree") {
 		t.Fatalf("Release error = %v, want a not-zero-managed rejection", err)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("expected only the ownership check, no unlock call, got %#v", runner.calls)
+	}
+}
+
+// TestReleaseRejectsManuallyLockedWorktree pins the fix for Release being
+// usable to clear a lock a user (or another tool) applied by hand to a
+// worktree that otherwise sits inside Zero's zero-worktree-<repoKey>
+// subtree: the ancestor-component check alone can't tell that lock apart
+// from one of Zero's own leases, so Release must also refuse to unlock an
+// entry whose recorded lock reason doesn't carry Zero's lease prefix.
+func TestReleaseRejectsManuallyLockedWorktree(t *testing.T) {
+	repoRoot := physicalTestPath(t, t.TempDir())
+	path := filepath.Join(t.TempDir(), "zero-worktree-"+repoKey(repoRoot), "task-a")
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeRunner{results: []CommandResult{
+		{Stdout: "worktree " + repoRoot + "\nworktree " + path + "\nlocked do not touch, in use\n"},
+	}}
+
+	err := Release(context.Background(), Options{RunGit: runner.Run}, path)
+	if err == nil || !strings.Contains(err.Error(), "not a zero lease") {
+		t.Fatalf("Release error = %v, want a not-a-zero-lease rejection", err)
 	}
 	if len(runner.calls) != 1 {
 		t.Fatalf("expected only the ownership check, no unlock call, got %#v", runner.calls)
