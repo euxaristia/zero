@@ -127,6 +127,12 @@ func TestWindowsEnumerateWritableDescendantsFindsExistingWritableChildren(t *tes
 	grantUsersWrite(t, outer)
 	inner := mkdir(t, filepath.Join(outer, "inner"))
 	grantUsersWrite(t, inner)
+	// Depth-3 writable child under non-writable ancestors: the scan must keep
+	// descending through non-writable parents or this escape stays open.
+	level1 := mkdir(t, filepath.Join(root, "locked1"))
+	level2 := mkdir(t, filepath.Join(level1, "locked2"))
+	deepWritable := mkdir(t, filepath.Join(level2, "deep-writable"))
+	grantUsersWrite(t, deepWritable)
 	plain := mkdir(t, filepath.Join(root, "plain"))
 	workspace := mkdir(t, filepath.Join(root, "workspace"))
 	grantUsersWrite(t, workspace)
@@ -142,6 +148,9 @@ func TestWindowsEnumerateWritableDescendantsFindsExistingWritableChildren(t *tes
 	}
 	if !windowsPathListContains(found, inner) {
 		t.Fatalf("enumeration = %#v, want it to include nested writable descendant %q", found, inner)
+	}
+	if !windowsPathListContains(found, deepWritable) {
+		t.Fatalf("enumeration = %#v, want it to include depth-3 writable child %q under non-writable ancestors", found, deepWritable)
 	}
 	if !windowsPathListContains(found, writableFile) {
 		t.Fatalf("enumeration = %#v, want it to include writable file %q (a file is as much an escape surface as a directory)", found, writableFile)
@@ -166,6 +175,61 @@ func TestWindowsEnumerateWritableDescendantsFindsExistingWritableChildren(t *tes
 	}
 	if !windowsPathListContains(excluded, outer) {
 		t.Fatalf("enumeration = %#v, want it to still include %q when a different path is excluded", excluded, outer)
+	}
+}
+
+// TestWindowsEnumerateWritableDescendantsFailsClosedOnEntryCap pins that
+// exhausting the descendant entry budget is an error, not a silent partial
+// success that would still let setup broaden the restricted token.
+func TestWindowsEnumerateWritableDescendantsFailsClosedOnEntryCap(t *testing.T) {
+	prev := windowsDescendantScanMaxDirs
+	windowsDescendantScanMaxDirs = 3
+	t.Cleanup(func() { windowsDescendantScanMaxDirs = prev })
+
+	root := t.TempDir()
+	for _, name := range []string{"a", "b", "c", "d"} {
+		mkdir(t, filepath.Join(root, name))
+	}
+	_, err := windowsEnumerateWritableDescendants(root, nil)
+	if err == nil {
+		t.Fatal("windowsEnumerateWritableDescendants: expected entry-cap error, got nil")
+	}
+}
+
+// TestWindowsPathDeniesCapabilitySIDRoundTrip ensures the pre-broaden hole
+// check can see a deny ACE that applyWindowsSharedDescendantDenies just wrote.
+func TestWindowsPathDeniesCapabilitySIDRoundTrip(t *testing.T) {
+	caps, err := LoadOrCreateWindowsCapabilitySIDs(t.TempDir())
+	if err != nil {
+		t.Fatalf("LoadOrCreateWindowsCapabilitySIDs: %v", err)
+	}
+	root := t.TempDir()
+	writable := mkdir(t, filepath.Join(root, "writable"))
+	grantUsersWrite(t, writable)
+
+	before, err := windowsPathDeniesCapabilitySID(writable, caps.ReadOnly)
+	if err != nil {
+		t.Fatalf("windowsPathDeniesCapabilitySID before: %v", err)
+	}
+	if before {
+		t.Fatal("path already denies capability SID before apply")
+	}
+	if _, err := applyWindowsSharedDescendantDenies(root, caps.ReadOnly, nil); err != nil {
+		t.Fatalf("applyWindowsSharedDescendantDenies: %v", err)
+	}
+	after, err := windowsPathDeniesCapabilitySID(writable, caps.ReadOnly)
+	if err != nil {
+		t.Fatalf("windowsPathDeniesCapabilitySID after: %v", err)
+	}
+	if !after {
+		t.Fatal("path does not deny capability SID after apply")
+	}
+	holes, err := windowsUncoveredWritableDescendants(root, caps.ReadOnly, nil)
+	if err != nil {
+		t.Fatalf("windowsUncoveredWritableDescendants: %v", err)
+	}
+	if len(holes) != 0 {
+		t.Fatalf("holes = %#v, want none after apply", holes)
 	}
 }
 

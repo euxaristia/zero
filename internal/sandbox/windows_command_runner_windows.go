@@ -94,8 +94,21 @@ func runWindowsSandboxCommand(config WindowsSandboxCommandConfig, stderr io.Writ
 	// write root. Fail closed there and keep the narrow SID set — reads of
 	// Users-granted system paths stay broken on such hosts, but the write
 	// jail holds.
+	//
+	// Before broadening, revalidate/reapply direct denies on any currently
+	// Users/AuthUsers-writable descendants of the shared roots. Setup alone is
+	// a point-in-time snapshot; non-inheriting denies do not cover children
+	// created afterward. If coverage cannot be re-established, keep the narrow
+	// SID set rather than widening the write jail.
 	broadenReadSIDs := config.SandboxLevel == WindowsSandboxLevelRestrictedToken && !writeRestricted &&
 		windowsSystemDriveIsOnlyFixedVolume()
+	if broadenReadSIDs {
+		if err := windowsEnsureSharedDescendantCoverage(config); err != nil {
+			fmt.Fprintf(stderr, "%s: shared descendant write coverage incomplete (%v); keeping narrow restricting SIDs\n",
+				WindowsSandboxCommandRunnerName, err)
+			broadenReadSIDs = false
+		}
+	}
 	if broadenReadSIDs {
 		// The shared-directory DenyWrite mitigation names the one stable
 		// read-only capability SID rather than the per-workspace SIDs (see

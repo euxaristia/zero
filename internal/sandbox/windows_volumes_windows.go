@@ -94,7 +94,7 @@ func windowsVolumeMountsOnlySystemDrive(volumeName, systemDrive string) (bool, e
 	}
 
 	for _, mountPath := range windowsSplitNulList(buf) {
-		if !strings.EqualFold(strings.ToUpper(strings.TrimSuffix(mountPath, `\`)), systemDrive) {
+		if !windowsMountPathIsOnlySystemDrive(mountPath, systemDrive) {
 			return false, nil
 		}
 	}
