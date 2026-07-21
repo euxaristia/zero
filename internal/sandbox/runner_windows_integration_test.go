@@ -81,18 +81,19 @@ func TestWindowsRestrictedTokenRealSandboxSmoke(t *testing.T) {
 	// (ProgramData, Windows\Temp), and outside every workspace write root.
 	publicDir := os.Getenv("PUBLIC")
 	if publicDir == "" {
-		t.Skip("PUBLIC is not set; cannot probe C:\\Users\\Public write jail")
-	}
-	publicMarker := filepath.Join(publicDir, "zero-elevated-write-denied.txt")
-	_ = os.Remove(publicMarker)
-	runWindowsRealSmokeCommand(t, runnerExe, config, []string{
-		"cmd.exe", "/d", "/s", "/c", "echo leaked>" + publicMarker,
-	}, 1)
-	if _, err := os.Stat(publicMarker); err == nil {
+		t.Log("PUBLIC is not set; skipping C:\\Users\\Public write-jail probe")
+	} else {
+		publicMarker := filepath.Join(publicDir, "zero-elevated-write-denied.txt")
 		_ = os.Remove(publicMarker)
-		t.Fatalf("Windows sandbox allowed a write to the shared C:\\Users\\Public directory")
-	} else if !os.IsNotExist(err) {
-		t.Fatalf("stat public marker: %v", err)
+		runWindowsRealSmokeCommand(t, runnerExe, config, []string{
+			"cmd.exe", "/d", "/s", "/c", "echo leaked>" + publicMarker,
+		}, 1)
+		if _, err := os.Stat(publicMarker); err == nil {
+			_ = os.Remove(publicMarker)
+			t.Fatalf("Windows sandbox allowed a write to the shared C:\\Users\\Public directory")
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("stat public marker: %v", err)
+		}
 	}
 
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")

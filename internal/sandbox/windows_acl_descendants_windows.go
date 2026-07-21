@@ -203,8 +203,12 @@ func windowsEnumerateWritableDescendants(root string, writeRoots []string) ([]st
 			// Always descend (subject to caps), including through non-writable
 			// ancestors, so a deep writable child is not missed. Stock huge
 			// non-writable system trees are pruned by basename only when the
-			// probe confirmed they are not Users/AuthUsers-writable.
-			if !writable && windowsDescendantScanNameIsPruned(entry.Name()) {
+			// probe confirmed they are not Users/AuthUsers-writable, and only at
+			// the scan root's direct children: a nested directory several levels
+			// down that happens to share one of these basenames (e.g. a subfolder
+			// literally named "Program Files") must still be descended into, or a
+			// writable descendant beneath it could be missed.
+			if !writable && current.depth == 0 && windowsDescendantScanNameIsPruned(entry.Name()) {
 				continue
 			}
 			queue = append(queue, node{path: child, depth: childDepth})
@@ -427,6 +431,14 @@ func windowsPathDeniesCapabilitySID(path, wantSID string) (bool, error) {
 			return false, fmt.Errorf("read ACE %d of %s: %w", index, path, err)
 		}
 		if ace.Header.AceType != windows.ACCESS_DENIED_ACE_TYPE && ace.Header.AceType != windowsAccessDeniedObjectAceType {
+			continue
+		}
+		// An INHERIT_ONLY ACE does not apply to this object itself (see the
+		// same skip in windowsDirGrantsBroadenedWrite). Counting one here
+		// would report an inherited-but-inapplicable deny as "already
+		// denied," causing applyWindowsSharedDescendantDenies to skip
+		// applying the real, effective deny and leave the descendant open.
+		if ace.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0 {
 			continue
 		}
 		sid, ok := windowsAceSID(ace)
