@@ -272,8 +272,8 @@ func windowsEnumerateWritableDescendants(root string, writeRoots []string) ([]st
 // exposes just ACCESS_ALLOWED_ACE_TYPE/ACCESS_DENIED_ACE_TYPE, so all four are
 // declared locally.
 const (
-	windowsAccessAllowedObjectAceType        = 0x05
-	windowsAccessDeniedObjectAceType         = 0x06
+	windowsAccessAllowedObjectAceType         = 0x05
+	windowsAccessDeniedObjectAceType          = 0x06
 	windowsAccessAllowedCallbackAceType       = 0x09
 	windowsAccessAllowedCallbackObjectAceType = 0x0B
 )
