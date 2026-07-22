@@ -46,7 +46,15 @@ func TestDefaultRunGitSeparatesStdoutAndStderr(t *testing.T) {
 func TestPrepareCreatesDetachedGitWorktree(t *testing.T) {
 	root := t.TempDir()
 	base := t.TempDir()
+	// autoAbsoluteGitDir answers Prepare's post-lock ownership-marker write
+	// (`git rev-parse --absolute-git-dir`) for the newly created worktree
+	// without a canned result: without it, the fake runner falls off the end
+	// of results and returns an empty CommandResult, so writeOwnershipMarker
+	// resolves gitDir to "" and os.WriteFile writes "zero-owner" as a
+	// relative path into the test process's actual working directory instead
+	// of failing loudly.
 	runner := &fakeRunner{
+		autoAbsoluteGitDir: true,
 		results: []CommandResult{
 			{Stdout: root + "\n"},
 			{Stdout: "worktree " + root + "\n"},
@@ -88,6 +96,15 @@ func TestPrepareCreatesDetachedGitWorktree(t *testing.T) {
 	}
 	if !result.LockAcquired {
 		t.Fatalf("LockAcquired = false, want true for a worktree this call created")
+	}
+	// Prepare must also persist the ownership marker so Release/Clean can
+	// tell this worktree apart from one a user created and locked by hand
+	// under the same predictable zero-worktree-<repoKey> path convention.
+	if got := runner.commandLine(6); got != "git rev-parse --absolute-git-dir" {
+		t.Fatalf("marker write command = %q", got)
+	}
+	if len(runner.calls) != 7 {
+		t.Fatalf("expected metadata calls plus lock and marker write, got %#v", runner.calls)
 	}
 }
 
@@ -141,6 +158,42 @@ func TestReleaseUnlocksWorktree(t *testing.T) {
 	}
 	if got := runner.commandLine(2); got != "git worktree unlock "+path {
 		t.Fatalf("git worktree unlock command = %q", got)
+	}
+}
+
+// TestReleaseRejectsForgedZeroLeaseWithoutOwnershipMarker pins the fix for
+// ownership being inferred from the public zero-worktree-<repoKey> path
+// convention plus a lock reason that merely starts with leaseReasonPrefix: a
+// user (or another tool) can create a same-repository worktree at that
+// predictable path and lock it by hand with a reason like "zero: active task
+// worktree manually-owned", which passes both the ancestor-component and
+// HasPrefix checks. Only the ownership marker Prepare itself writes can tell
+// that apart from a genuine Zero lease, so Release must still refuse to
+// unlock it when the worktree directory exists but carries no marker.
+func TestReleaseRejectsForgedZeroLeaseWithoutOwnershipMarker(t *testing.T) {
+	repoRoot := physicalTestPath(t, t.TempDir())
+	base := physicalTestPath(t, t.TempDir())
+	path := filepath.Join(base, "zero-worktree-"+repoKey(repoRoot), "manually-owned")
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately no plantOwnershipMarker call: this worktree exists and is
+	// locked with a reason that starts with leaseReasonPrefix, exactly what a
+	// user could reproduce by hand, but Prepare never created it.
+	runner := &fakeRunner{
+		autoAbsoluteGitDir: true,
+		results: []CommandResult{
+			{Stdout: "worktree " + repoRoot + "\nworktree " + path + "\nlocked " + leaseReasonPrefix + " manually-owned\n"},
+		},
+	}
+
+	err := Release(context.Background(), Options{RunGit: runner.Run}, path)
+	if err == nil || !strings.Contains(err.Error(), "missing zero ownership marker") {
+		t.Fatalf("Release error = %v, want a missing-ownership-marker rejection", err)
+	}
+	// list + marker check, no unlock call.
+	if len(runner.calls) != 2 {
+		t.Fatalf("expected only the ownership check and marker read, no unlock call, got %#v", runner.calls)
 	}
 }
 
@@ -456,6 +509,65 @@ func TestPrepareFromLinkedWorktreeCanBeReleased(t *testing.T) {
 
 	if err := Release(ctx, Options{}, result.Path); err != nil {
 		t.Fatalf("Release of a worktree Prepare created from a linked worktree: %v", err)
+	}
+}
+
+// TestCleanFromLinkedWorktreePrunesStaleWorktree pins the fix for Clean
+// keying its owned-subtree bucket off repoRoot (--show-toplevel for whatever
+// worktree Clean itself runs from) instead of the main worktree's root:
+// Prepare and Clean must agree on repoKey regardless of which checkout
+// either call runs from, or a Clean invoked from a linked worktree computes
+// a different repoDir than Prepare used and silently skips every
+// zero-owned worktree for the repository.
+func TestCleanFromLinkedWorktreePrunesStaleWorktree(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	ctx := context.Background()
+	mainRepo := physicalTestPath(t, t.TempDir())
+	mustGit := func(dir string, args ...string) string {
+		t.Helper()
+		out, err := gitOutput(ctx, defaultRunGit, dir, args...)
+		if err != nil {
+			t.Skipf("git unavailable or failed (%v): %v", args, err)
+		}
+		return out
+	}
+	mustGit(mainRepo, "init")
+	mustGit(mainRepo, "-c", "user.email=t@example.invalid", "-c", "user.name=t", "commit", "--allow-empty", "-m", "seed")
+
+	// A linked worktree of mainRepo, checked out elsewhere on disk. Its own
+	// --show-toplevel is this directory, not mainRepo, so Clean run from here
+	// would compute repoKey(linkedWorktree) unless it instead keys off the
+	// main worktree's root the way Prepare does.
+	linkedWorktree := filepath.Join(t.TempDir(), "linked")
+	mustGit(mainRepo, "worktree", "add", "--detach", linkedWorktree, "HEAD")
+
+	base := physicalTestPath(t, t.TempDir())
+	result, err := Prepare(ctx, Options{Cwd: linkedWorktree, BaseDir: base, Name: "stale-from-linked"})
+	if err != nil {
+		t.Fatalf("Prepare from a linked worktree: %v", err)
+	}
+	if err := Release(ctx, Options{Cwd: linkedWorktree}, result.Path); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	old := time.Now().Add(-48 * time.Hour)
+	if err := filepath.WalkDir(result.Path, func(path string, _ os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		return os.Chtimes(path, old, old)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Clean itself also runs from the linked worktree here, mirroring a
+	// Prepare/Clean invocation started from a linked checkout.
+	if err := Clean(ctx, Options{Cwd: linkedWorktree, BaseDir: base}, 24*time.Hour); err != nil {
+		t.Fatalf("Clean: %v", err)
+	}
+	if _, err := os.Stat(result.Path); !os.IsNotExist(err) {
+		t.Fatalf("Clean run from a linked worktree should have pruned the stale zero-owned worktree, stat err: %v", err)
 	}
 }
 
