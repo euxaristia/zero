@@ -448,9 +448,9 @@ var dunePalette = palette{
 	ink:       "#ececee",
 	muted:     "#ccccd2", // secondary text — bright gray, top of the ramp
 	faint:     "#b8b8c0", // hints/metadata
-	faintest:  "#a0a0a8", // line numbers/separators — bright enough to hold AA on the near-black selBg/addBg/delBg after xterm-256 quantization
+	faintest:  "#55c6cd", // line numbers/separators — a neutral gray at this brightness quantizes to xterm #005f00's near-neighbor at only 2.97:1 on the add-diff gutter; nudging toward cyan (still under the faint/faintest/panel ramp) keeps AA (4.62:1) once xterm-256 rounds it
 	accent:    "#ff9628", // brand/claude rgb(255,150,40), adjusted for deuteranopia
-	green:     "#3399ff", // success rgb(51,153,255) — blue under colorblind mode
+	green:     "#5eccfa", // success — brightened past Claude Code's rgb(51,153,255) so the add-diff sign text stays AA (4.80:1) against addBg once xterm-256 quantizes both to #5fd7ff/#005f00 (2.43:1 at the original value)
 	red:       "#ff6666", // error rgb(255,102,102)
 	amber:     "#ffcc00", // warning rgb(255,204,0)
 	blue:      "#99ccff", // permission rgb(153,204,255)
@@ -462,7 +462,7 @@ var dunePalette = palette{
 	delBgWord: "#740000", // word-level removed span — quantizes to xterm red #870000 (see addBgWord)
 	permBg:    "#1c1915",
 	selBg:     "#191c1f", // selection — near-black, distinct from panel, AA with faint/faintest
-	addInk:    "#bdeed7",
+	addInk:    "#f0f5d2", // changed-word text — lightened so it still clears AA (4.60:1) against addBgWord's xterm-256 quantized #008700 (the original #bdeed7 fell to 4.06:1)
 	delInk:    "#f2c4c4",
 	onAccent:  "#000000",
 	cardRun:   "#3399ff", // success blue

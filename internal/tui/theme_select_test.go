@@ -409,7 +409,9 @@ func xterm256Hex(t *testing.T, hexColor string) string {
 // Guard the pairs that regressed: Dune's selected-row affordances (accent
 // caret/favorite star and blue local-model dot over selBg via onSel) and
 // diff bands (whose previous addBg/delBg and addBgWord/delBgWord values all
-// quantized to the same grays), and Neon's diff bands with the same issue.
+// quantized to the same grays), plus the rendered add-diff content itself
+// (gutter and changed-word text, which quantization made unreadable even
+// once the bands were distinct), and Neon's diff bands with the same issues.
 func TestExtendedThemeANSI256Contrast(t *testing.T) {
 	palettes := map[string]palette{}
 	for _, entry := range themeRegistry {
@@ -454,6 +456,25 @@ func TestExtendedThemeANSI256Contrast(t *testing.T) {
 	}
 	if q(dune.delBgWord) == q(dune.delBg) {
 		t.Errorf("dune: changed span is indistinguishable from its del row after quantization (both %s)", q(dune.delBg))
+	}
+	if r := wcagRatio(t, q(dune.green), q(dune.addBg)); r < 4.5 {
+		t.Errorf("dune: green on addBg = %.2f < 4.5 after quantization", r)
+	}
+	if r := wcagRatio(t, q(dune.red), q(dune.delBg)); r < 4.5 {
+		t.Errorf("dune: red on delBg = %.2f < 4.5 after quantization", r)
+	}
+	// The two rendered diff-content pairs a 256-color terminal actually shows:
+	// line numbers (faintest on addBg/delBg) and highlighted changed spans
+	// (addInk/delInk on their word bands). Mirrors the Neon assertions below.
+	for _, pair := range []struct{ name, fg, bg string }{
+		{"faintest on addBg", dune.faintest, dune.addBg},
+		{"faintest on delBg", dune.faintest, dune.delBg},
+		{"addInk on addBgWord", dune.addInk, dune.addBgWord},
+		{"delInk on delBgWord", dune.delInk, dune.delBgWord},
+	} {
+		if r := wcagRatio(t, q(pair.fg), q(pair.bg)); r < 4.5 {
+			t.Errorf("dune: %s = %.2f < 4.5 after quantization (%s on %s)", pair.name, r, q(pair.fg), q(pair.bg))
+		}
 	}
 
 	neon := palettes["neon"]
