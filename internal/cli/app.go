@@ -95,6 +95,8 @@ type appDeps struct {
 	headCommitSubject      func(context.Context, string) string
 	commitsAhead           func(context.Context, string, string, string) (int, error)
 	isUnbornRemote         func(context.Context, string, string) (bool, error)
+	refreshTrackingRef     func(context.Context, string, string, string) error
+	branchHasUpstream      func(context.Context, string, string) (bool, error)
 	runTUI                 func(context.Context, tui.Options) int
 	runEditor              func(string) error
 	checkUpdate            func(context.Context, update.Options) (update.Result, error)
@@ -214,6 +216,12 @@ func defaultAppDeps() appDeps {
 		},
 		isUnbornRemote: func(ctx context.Context, cwd, remote string) (bool, error) {
 			return zerogit.IsUnbornRemote(ctx, cwd, remote, nil)
+		},
+		refreshTrackingRef: func(ctx context.Context, cwd, remote, branch string) error {
+			return zerogit.RefreshTrackingRef(ctx, cwd, remote, branch, nil)
+		},
+		branchHasUpstream: func(ctx context.Context, cwd, branch string) (bool, error) {
+			return zerogit.HasUpstream(ctx, cwd, branch, nil)
 		},
 		runTUI:      tui.Run,
 		runEditor:   openEditor,
@@ -593,6 +601,12 @@ func fillAppDeps(deps appDeps) appDeps {
 	}
 	if deps.isUnbornRemote == nil {
 		deps.isUnbornRemote = defaults.isUnbornRemote
+	}
+	if deps.refreshTrackingRef == nil {
+		deps.refreshTrackingRef = defaults.refreshTrackingRef
+	}
+	if deps.branchHasUpstream == nil {
+		deps.branchHasUpstream = defaults.branchHasUpstream
 	}
 	if deps.runTUI == nil {
 		deps.runTUI = defaults.runTUI
