@@ -122,6 +122,23 @@ func TestScanDetectsModernPrefixedOpenAIKeys(t *testing.T) {
 	}
 }
 
+func TestScanDetectsHyphenatedOpenAICompatibleKeys(t *testing.T) {
+	// OpenRouter's sk-or-v1- keys are hyphenated like the modern sk-proj-
+	// family; the legacy sk-<alnum-only> branch does not match a "-" right
+	// after "sk-", so this format needs its own explicit prefix branch.
+	key := "sk-or-v1-1234567890abcdef1234567890abcdef1234567890abcdef1234"
+	redacted, findings := Redact("token=" + key)
+	if len(findings) != 1 || findings[0].Type != "openai_key" {
+		t.Fatalf("expected one openai_key finding for %q, got %#v", key, findings)
+	}
+	if strings.Contains(redacted, key) {
+		t.Fatalf("key leaked after redaction: %q", redacted)
+	}
+	if !strings.Contains(redacted, "[REDACTED:openai_key]") {
+		t.Fatalf("missing typed placeholder for %q: %q", key, redacted)
+	}
+}
+
 func TestScanRedactsLongerKeysWithoutTailLeak(t *testing.T) {
 	cases := []struct {
 		wantType string

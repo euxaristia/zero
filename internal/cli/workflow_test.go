@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -312,6 +313,32 @@ func TestRunWorktreesReleaseReportsErrors(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "not a valid worktree") {
 		t.Fatalf("expected underlying error, got %q", stderr.String())
+	}
+}
+
+func TestRunWorktreesReleaseRedactsErrorText(t *testing.T) {
+	// Release errors interpolate the caller-supplied path (see
+	// verifyZeroOwnedWorktree's "refusing to release %s" messages); unlike the
+	// success path, which redacts before printing, the error was previously
+	// forwarded to stderr verbatim, so a rejected path containing a key-shaped
+	// segment would reach terminal/model-visible output unredacted.
+	secret := "sk-proj-abcDEF123_ghiJKL456-mnoPQR789stu"
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	exitCode := runWithDeps([]string{"worktrees", "release", "/tmp/" + secret + "/task"}, &stdout, &stderr, appDeps{
+		releaseWorktree: func(context.Context, worktrees.Options, string) error {
+			return fmt.Errorf("refusing to release /tmp/%s/task: not a registered worktree of this repository", secret)
+		},
+	})
+
+	if exitCode != exitUsage {
+		t.Fatalf("expected usage exit %d, got %d", exitUsage, exitCode)
+	}
+	if strings.Contains(stderr.String(), secret) {
+		t.Fatalf("release error leaked unredacted key-shaped path: %q", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "[REDACTED]") {
+		t.Fatalf("expected redaction placeholder in error output, got %q", stderr.String())
 	}
 }
 
@@ -892,6 +919,45 @@ func TestRunExecWorktreeSurfacesReleaseFailure(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), worktreeDir) || !strings.Contains(stderr.String(), "boom") {
 		t.Fatalf("expected release failure with path on stderr, got %q", stderr.String())
+	}
+}
+
+func TestRunExecWorktreeRedactsReleaseFailureText(t *testing.T) {
+	// The release path argument was already redacted before this diagnostic
+	// was added, but the error's own text was forwarded verbatim; Release's
+	// ownership errors interpolate the caller-supplied path (see
+	// verifyZeroOwnedWorktree), so a key-shaped path reaching this message
+	// leaked unredacted onto stderr.
+	root := t.TempDir()
+	worktreeDir := t.TempDir()
+	secret := "sk-proj-abcDEF123_ghiJKL456-mnoPQR789stu"
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	exitCode := runWithDeps([]string{"exec", "--worktree", "task-a", "hello"}, &stdout, &stderr, appDeps{
+		getwd: func() (string, error) { return root, nil },
+		prepareWorktree: func(ctx context.Context, options worktrees.Options) (worktrees.Result, error) {
+			return worktrees.Result{Name: "task-a", Path: worktreeDir, RepoRoot: root, SourceBranch: "main", SourceCommit: "abc1234", LockAcquired: true}, nil
+		},
+		releaseWorktree: func(ctx context.Context, options worktrees.Options, path string) error {
+			return fmt.Errorf("refusing to release /tmp/%s/task: not a registered worktree of this repository", secret)
+		},
+		resolveConfig: func(workspaceRoot string, overrides config.Overrides) (config.ResolvedConfig, error) {
+			return execResolvedConfig(), nil
+		},
+		newProvider: func(config.ProviderProfile) (zeroruntime.Provider, error) {
+			return echoExecProvider{}, nil
+		},
+	})
+
+	if exitCode != exitSuccess {
+		t.Fatalf("expected exit code %d, got %d: %s", exitSuccess, exitCode, stderr.String())
+	}
+	if strings.Contains(stderr.String(), secret) {
+		t.Fatalf("deferred release diagnostic leaked unredacted key-shaped path: %q", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "[REDACTED]") {
+		t.Fatalf("expected redaction placeholder in deferred release diagnostic, got %q", stderr.String())
 	}
 }
 

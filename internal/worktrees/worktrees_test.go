@@ -49,6 +49,7 @@ func TestPrepareCreatesDetachedGitWorktree(t *testing.T) {
 	runner := &fakeRunner{
 		results: []CommandResult{
 			{Stdout: root + "\n"},
+			{Stdout: "worktree " + root + "\n"},
 			{Stdout: "main\n"},
 			{Stdout: "abc1234\n"},
 			{},
@@ -76,13 +77,13 @@ func TestPrepareCreatesDetachedGitWorktree(t *testing.T) {
 	if !strings.HasPrefix(result.Path, filepath.Join(base, "zero-worktree-")) {
 		t.Fatalf("Path = %q, want under base %q", result.Path, base)
 	}
-	if got := runner.commandLine(3); got != "git worktree add --detach "+result.Path+" HEAD" {
+	if got := runner.commandLine(4); got != "git worktree add --detach "+result.Path+" HEAD" {
 		t.Fatalf("git worktree command = %q", got)
 	}
 	// Prepare must lock every worktree it creates: this is what makes
 	// entry.locked inside Clean protect zero's own worktrees, not just ones a
 	// human locked by hand (see TestCleanSkipsLockedZeroOwnedWorktree).
-	if got := runner.commandLine(4); got != "git worktree lock --reason zero: active task worktree "+result.Path {
+	if got := runner.commandLine(5); got != "git worktree lock --reason zero: active task worktree "+result.Path {
 		t.Fatalf("git worktree lock command = %q", got)
 	}
 	if !result.LockAcquired {
@@ -272,6 +273,7 @@ func TestPrepareReusesExistingGitWorktree(t *testing.T) {
 	runner := &fakeRunner{
 		results: []CommandResult{
 			{Stdout: root + "\n"},
+			{Stdout: "worktree " + root + "\n"},
 			{Stdout: "main\n"},
 			{Stdout: "abc1234\n"},
 			{Stdout: sourceGit + "\n"},
@@ -296,13 +298,13 @@ func TestPrepareReusesExistingGitWorktree(t *testing.T) {
 	if result.Path != existing {
 		t.Fatalf("Path = %q, want existing %q", result.Path, existing)
 	}
-	if len(runner.calls) != 6 {
+	if len(runner.calls) != 7 {
 		t.Fatalf("expected metadata git calls plus lock, got %#v", runner.calls)
 	}
 	// The original lock may have been released by a prior run's exit, which
 	// would leave the reused worktree exposed to Clean's staleness heuristic
 	// while this caller is still using it: reuse must re-establish the lease.
-	if got := runner.commandLine(5); got != "git worktree lock --reason zero: active task worktree "+existing {
+	if got := runner.commandLine(6); got != "git worktree lock --reason zero: active task worktree "+existing {
 		t.Fatalf("git worktree lock command = %q", got)
 	}
 	if !result.LockAcquired {
@@ -329,6 +331,7 @@ func TestPrepareRejectsWorktreeLockedByAnotherRun(t *testing.T) {
 	runner := &fakeRunner{
 		results: []CommandResult{
 			{Stdout: root + "\n"},
+			{Stdout: "worktree " + root + "\n"},
 			{Stdout: "main\n"},
 			{Stdout: "abc1234\n"},
 			{Stdout: sourceGit + "\n"},
@@ -348,6 +351,45 @@ func TestPrepareRejectsWorktreeLockedByAnotherRun(t *testing.T) {
 	}
 }
 
+// TestPrepareRollsBackWorktreeOnLockFailure pins the fix for a newly created
+// worktree being left behind, unleased, when the lock call after `git
+// worktree add` fails for a reason other than a concurrent racer (an actual
+// git failure, not "already locked"): nothing else can own a worktree this
+// call just created, so Prepare must remove it rather than leaking it until
+// Clean's staleness window eventually reclaims it.
+func TestPrepareRollsBackWorktreeOnLockFailure(t *testing.T) {
+	root := t.TempDir()
+	base := t.TempDir()
+	runner := &fakeRunner{
+		results: []CommandResult{
+			{Stdout: root + "\n"},
+			{Stdout: "worktree " + root + "\n"},
+			{Stdout: "main\n"},
+			{Stdout: "abc1234\n"},
+			{}, // worktree add
+			{ExitCode: 1, Stderr: "fatal: disk full"}, // worktree lock
+			{}, // worktree remove --force (rollback)
+		},
+	}
+
+	_, err := Prepare(context.Background(), Options{
+		Cwd:     root,
+		Name:    "review-api",
+		BaseDir: base,
+		RunGit:  runner.Run,
+	})
+	if err == nil || !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("Prepare must surface the lock failure, got %v", err)
+	}
+	if len(runner.calls) != 7 {
+		t.Fatalf("expected add, lock, and a rollback removal, got %#v", runner.calls)
+	}
+	lastCall := runner.calls[len(runner.calls)-1]
+	if lastCall.args[0] != "worktree" || lastCall.args[1] != "remove" {
+		t.Fatalf("last call = %#v, want a rollback `git worktree remove`", lastCall)
+	}
+}
+
 // physicalTestPath resolves a test directory to its physical spelling
 // (symlinks and Windows 8.3 short names), matching how git records paths.
 func physicalTestPath(t *testing.T, path string) string {
@@ -357,6 +399,51 @@ func physicalTestPath(t *testing.T, path string) string {
 		t.Fatalf("resolve %s: %v", path, err)
 	}
 	return resolved
+}
+
+// TestPrepareFromLinkedWorktreeCanBeReleased pins the fix for Prepare and
+// Release deriving different repoKeys when Prepare is invoked from a linked
+// worktree instead of the main one. Before the fix, Prepare hashed
+// --show-toplevel (the linked checkout's own root when run there), while
+// Release always hashes the main worktree's root (via git worktree list
+// --porcelain, whose first entry is always the main worktree); a worktree
+// prepared from a linked checkout therefore failed its own ownership check
+// on release and its lease could never be cleared.
+func TestPrepareFromLinkedWorktreeCanBeReleased(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	ctx := context.Background()
+	mainRepo := physicalTestPath(t, t.TempDir())
+	mustGit := func(dir string, args ...string) string {
+		t.Helper()
+		out, err := gitOutput(ctx, defaultRunGit, dir, args...)
+		if err != nil {
+			t.Skipf("git unavailable or failed (%v): %v", args, err)
+		}
+		return out
+	}
+	mustGit(mainRepo, "init")
+	mustGit(mainRepo, "-c", "user.email=t@example.invalid", "-c", "user.name=t", "commit", "--allow-empty", "-m", "seed")
+
+	// A linked worktree of mainRepo, checked out elsewhere on disk. Its own
+	// --show-toplevel is this directory, not mainRepo.
+	linkedWorktree := filepath.Join(t.TempDir(), "linked")
+	mustGit(mainRepo, "worktree", "add", "--detach", linkedWorktree, "HEAD")
+
+	base := physicalTestPath(t, t.TempDir())
+	result, err := Prepare(ctx, Options{Cwd: linkedWorktree, BaseDir: base, Name: "from-linked"})
+	if err != nil {
+		t.Fatalf("Prepare from a linked worktree: %v", err)
+	}
+	wantComponent := "zero-worktree-" + repoKey(mainRepo)
+	if !strings.Contains(result.Path, wantComponent) {
+		t.Fatalf("Path = %q, want it keyed off the main worktree %q (component %q)", result.Path, mainRepo, wantComponent)
+	}
+
+	if err := Release(ctx, Options{}, result.Path); err != nil {
+		t.Fatalf("Release of a worktree Prepare created from a linked worktree: %v", err)
+	}
 }
 
 // TestCleanPrunesStaleWorktreeUnderSymlinkedBaseDir pins the fix for a
@@ -415,6 +502,42 @@ func TestCleanPrunesStaleWorktreeUnderSymlinkedBaseDir(t *testing.T) {
 	}
 	if _, err := os.Stat(staleDir); !os.IsNotExist(err) {
 		t.Fatalf("Clean should have pruned the stale worktree under the symlinked base dir, stat err: %v", err)
+	}
+}
+
+// TestReleaseRecoversDeletedWorktreeUnderSymlinkedBaseDir pins the fix for
+// the documented `release -C` recovery path failing when --worktree-dir was
+// a symlink and the worktree itself was then deleted by hand: EvalSymlinks
+// has nothing to resolve on a path that no longer exists, so the prior
+// Abs+Clean fallback kept the symlinked (logical) spelling, which never
+// matched git's physical-path porcelain entry, and the orphaned lock could
+// never be released. canonicalizePath must resolve through the nearest
+// existing ancestor (the symlink itself, since everything under it is gone)
+// and reattach the missing tail.
+func TestReleaseRecoversDeletedWorktreeUnderSymlinkedBaseDir(t *testing.T) {
+	ctx := context.Background()
+	repo := physicalTestPath(t, t.TempDir())
+	realBase := physicalTestPath(t, t.TempDir())
+	base := filepath.Join(t.TempDir(), "base-link")
+	if err := os.Symlink(realBase, base); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	// The worktree directory under the symlinked base was deleted by hand;
+	// nothing on disk exists below base itself.
+	deletedPath := filepath.Join(base, "zero-worktree-"+repoKey(repo), "already-deleted")
+	physicalPath := filepath.Join(realBase, "zero-worktree-"+repoKey(repo), "already-deleted")
+
+	runner := &fakeRunner{results: []CommandResult{
+		{Stdout: "worktree " + repo + "\nworktree " + physicalPath + "\nlocked " + leaseReasonPrefix + "\n"},
+		{},
+	}}
+
+	if err := Release(ctx, Options{RunGit: runner.Run, Cwd: repo}, deletedPath); err != nil {
+		t.Fatalf("Release must recover a deleted worktree under a symlinked base dir: %v", err)
+	}
+	if got := runner.commandLine(1); got != "git worktree unlock "+deletedPath {
+		t.Fatalf("git worktree unlock command = %q", got)
 	}
 }
 
@@ -491,6 +614,7 @@ func TestPrepareRejectsExistingWorktreeFromDifferentRepo(t *testing.T) {
 	runner := &fakeRunner{
 		results: []CommandResult{
 			{Stdout: root + "\n"},
+			{Stdout: "worktree " + root + "\n"},
 			{Stdout: "main\n"},
 			{Stdout: "abc1234\n"},
 			{Stdout: sourceGit + "\n"},
@@ -515,6 +639,7 @@ func TestPrepareValidatesNameAndExistingDirectory(t *testing.T) {
 	runner := &fakeRunner{
 		results: []CommandResult{
 			{Stdout: root + "\n"},
+			{Stdout: "worktree " + root + "\n"},
 			{Stdout: "main\n"},
 			{Stdout: "abc1234\n"},
 		},

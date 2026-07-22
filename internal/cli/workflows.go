@@ -175,7 +175,7 @@ func runWorktreesRelease(args []string, stdout io.Writer, stderr io.Writer, deps
 		releaseOptions.Cwd = workspaceRoot
 	}
 	if err := deps.releaseWorktree(context.Background(), releaseOptions, absPath); err != nil {
-		return writeExecUsageError(stderr, err.Error())
+		return writeExecUsageError(stderr, redactCLIString(err.Error()))
 	}
 	if _, err := fmt.Fprintf(stdout, "released %s\n", redactCLIString(path)); err != nil {
 		return exitCrash

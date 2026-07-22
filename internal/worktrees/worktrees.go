@@ -92,6 +92,19 @@ func Prepare(ctx context.Context, options Options) (Result, error) {
 		return Result{}, fmt.Errorf("not a git repository: %w", err)
 	}
 	repoRoot = filepath.Clean(repoRoot)
+	// Key the per-repository worktree bucket off the MAIN worktree's root, not
+	// repoRoot (which is whichever worktree - main or a linked one - this call
+	// happened to run from): git worktree list --porcelain always reports the
+	// main worktree first, regardless of invocation location, so this keeps
+	// Prepare and Release's ownership key derivation in agreement (see
+	// verifyZeroOwnedWorktree) even when Prepare runs from a linked worktree.
+	// Without it, a worktree prepared from a linked checkout hashes a
+	// different repoKey than Release computes, and its lease can never be
+	// cleared.
+	primaryRoot, err := primaryWorktreeRoot(ctx, runGit, repoRoot)
+	if err != nil {
+		return Result{}, err
+	}
 	branch, _ := gitOutput(ctx, runGit, repoRoot, "rev-parse", "--abbrev-ref", "HEAD")
 	commit, _ := gitOutput(ctx, runGit, repoRoot, "rev-parse", "--short", "HEAD")
 
@@ -107,7 +120,7 @@ func Prepare(ctx context.Context, options Options) (Result, error) {
 		return Result{}, fmt.Errorf("resolve worktree dir: %w", err)
 	}
 
-	repoDir := filepath.Join(baseDir, "zero-worktree-"+repoKey(repoRoot))
+	repoDir := filepath.Join(baseDir, "zero-worktree-"+repoKey(primaryRoot))
 	target := filepath.Join(repoDir, name)
 	result := Result{
 		Name:         name,
@@ -172,6 +185,20 @@ func Prepare(ctx context.Context, options Options) (Result, error) {
 	// this call never acquired.
 	acquired, err := lockWorktree(ctx, runGit, repoRoot, target, options.LeasePID)
 	if err != nil {
+		// This call created target and nothing else can own it yet (a
+		// concurrent racer would have made lockWorktree return acquired=false,
+		// not an error), so a failure here (not "already locked", an actual
+		// git failure) must not leave an unleased, newly created worktree
+		// behind: Clean cannot distinguish it from live-but-not-yet-touched
+		// work, so it would sit as a disk leak until the staleness window
+		// passes. Best-effort: report a removal failure alongside the
+		// original lock error rather than letting it mask the leak.
+		// gitOutput (not a raw runGit call) so a nonzero exit code is treated
+		// as a failure: defaultRunGit returns a nil error alongside a nonzero
+		// CommandResult.ExitCode for a failed git invocation.
+		if _, removeErr := gitOutput(ctx, runGit, repoRoot, "worktree", "remove", "--force", target); removeErr != nil {
+			return Result{}, errors.Join(err, fmt.Errorf("clean up worktree after failed lock: %w", removeErr))
+		}
 		return Result{}, err
 	}
 	if !acquired {
@@ -312,6 +339,9 @@ func verifyZeroOwnedWorktree(ctx context.Context, runGit GitRunner, dir string, 
 	if len(entries) == 0 {
 		return fmt.Errorf("resolve repository for %s: git worktree list returned no entries", path)
 	}
+	// entries[0].path is always the main worktree (see primaryWorktreeRoot),
+	// which is what Prepare now also keys its repoKey off, so this and Prepare
+	// agree regardless of which worktree either call ran from.
 	want := "zero-worktree-" + repoKey(entries[0].path)
 
 	target := canonicalizePath(path)
@@ -367,10 +397,45 @@ func canonicalizePath(path string) string {
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
 		return filepath.Clean(resolved)
 	}
-	if abs, err := filepath.Abs(path); err == nil {
-		return filepath.Clean(abs)
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return filepath.Clean(path)
 	}
-	return filepath.Clean(path)
+	abs = filepath.Clean(abs)
+	// path itself does not exist (the documented release -C recovery: the
+	// worktree directory was deleted by hand before releasing it), so
+	// EvalSymlinks above had nothing to resolve. If an ANCESTOR of path is
+	// itself a symlink (a symlinked --worktree-dir), the plain Abs+Clean
+	// fallback keeps that ancestor's logical spelling, which never matches
+	// git's physical-path porcelain entry, and the lock can never be
+	// released. Resolve symlinks through the nearest existing ancestor
+	// instead and reattach the missing tail.
+	return resolveThroughNearestExistingAncestor(abs)
+}
+
+// resolveThroughNearestExistingAncestor walks up from path until it finds an
+// existing ancestor directory, resolves that ancestor's symlinks, and
+// reattaches path's missing remainder onto the resolved ancestor.
+func resolveThroughNearestExistingAncestor(path string) string {
+	var missing []string
+	current := path
+	for {
+		if resolved, err := filepath.EvalSymlinks(current); err == nil {
+			result := filepath.Clean(resolved)
+			for i := len(missing) - 1; i >= 0; i-- {
+				result = filepath.Join(result, missing[i])
+			}
+			return result
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			// Reached the filesystem root without finding an existing
+			// ancestor; nothing left to resolve symlinks through.
+			return path
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
 }
 
 func DefaultBaseDir(env map[string]string) (string, error) {
@@ -460,6 +525,24 @@ func gitOutput(ctx context.Context, runGit GitRunner, dir string, args ...string
 		return "", fmt.Errorf("%s", message)
 	}
 	return strings.TrimSpace(result.Stdout), nil
+}
+
+// primaryWorktreeRoot returns the repository's main worktree path. `git
+// worktree list --porcelain` always reports the main worktree first (its
+// first entry), regardless of which linked worktree the command runs from -
+// which is what lets Prepare and verifyZeroOwnedWorktree agree on one
+// repoKey for the same repository even when invoked from different
+// worktrees of it.
+func primaryWorktreeRoot(ctx context.Context, runGit GitRunner, dir string) (string, error) {
+	output, err := gitOutput(ctx, runGit, dir, "worktree", "list", "--porcelain")
+	if err != nil {
+		return "", fmt.Errorf("resolve repository root: %w", err)
+	}
+	entries := parseWorktreeList(output)
+	if len(entries) == 0 {
+		return "", fmt.Errorf("resolve repository root: git worktree list returned no entries")
+	}
+	return entries[0].path, nil
 }
 
 func sameGitCommonDir(ctx context.Context, runGit GitRunner, sourceDir string, targetDir string) (bool, error) {
