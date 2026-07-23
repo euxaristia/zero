@@ -559,3 +559,50 @@ func TestWindowsAceSIDSkipsUnhandledAceTypes(t *testing.T) {
 		t.Fatal("windowsAceSID should return ok=false for an unhandled ACE type")
 	}
 }
+
+func TestWindowsPathDeniesCapabilitySIDRequiresEssentialWriteMask(t *testing.T) {
+	dir := t.TempDir()
+	sid := "S-1-1-0"
+
+	group := windowsACLPathGroup{
+		Path: dir,
+		Entries: []WindowsACLEntry{{
+			Action:     WindowsACLDenyWrite,
+			Path:       dir,
+			Capability: sid,
+		}},
+	}
+	if _, _, err := applyWindowsACLPathGroup(group); err != nil {
+		t.Fatal(err)
+	}
+
+	denied, err := windowsPathDeniesCapabilitySID(dir, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !denied {
+		t.Fatal("expected full DenyWrite to satisfy windowsPathDeniesCapabilitySID")
+	}
+}
+
+func TestWindowsEnsureSharedDescendantCoverageDeduplicatesRootDeny(t *testing.T) {
+	dir := t.TempDir()
+	sid := "S-1-1-0"
+
+	group := windowsACLPathGroup{
+		Path: dir,
+		Entries: []WindowsACLEntry{{
+			Action:     WindowsACLDenyWrite,
+			Path:       dir,
+			Capability: sid,
+		}},
+	}
+	if _, _, err := applyWindowsACLPathGroup(group); err != nil {
+		t.Fatal(err)
+	}
+
+	denied, err := windowsPathDeniesCapabilitySID(dir, sid)
+	if err != nil || !denied {
+		t.Fatalf("expected root to be denied before re-check, denied=%v, err=%v", denied, err)
+	}
+}
