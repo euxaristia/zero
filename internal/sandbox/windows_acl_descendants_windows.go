@@ -195,6 +195,9 @@ func windowsEnumerateWritableDescendants(root string, writeRoots []string) ([]st
 		queue = queue[1:]
 		entries, err := os.ReadDir(current.path)
 		if err != nil {
+			if windowsPathIsReparsePoint(current.path) && os.IsPermission(err) {
+				continue
+			}
 			// The system-locked basename allowlist only applies to the real
 			// thing: a canonical root-level system directory directly under an
 			// actual drive letter root. A same-named directory anywhere else in
@@ -212,12 +215,16 @@ func windowsEnumerateWritableDescendants(root string, writeRoots []string) ([]st
 			if isExcluded(childKey) {
 				continue
 			}
+			isReparse := (entry.Type()&os.ModeSymlink != 0) || (entry.Type()&os.ModeIrregular != 0)
 			if visited >= windowsDescendantScanMaxDirs {
 				return nil, fmt.Errorf("descendant scan exceeded %d entries below %s", windowsDescendantScanMaxDirs, root)
 			}
 			visited++
 			writable, err := windowsDirGrantsBroadenedWrite(child)
 			if err != nil {
+				if isReparse && os.IsPermission(err) {
+					continue
+				}
 				// Same canonical-root-level scoping as the ReadDir case above:
 				// current.path (child's parent) must itself be a drive root for
 				// this to be the real, SYSTEM-exclusive directory.
@@ -229,7 +236,7 @@ func windowsEnumerateWritableDescendants(root string, writeRoots []string) ([]st
 			if writable {
 				out = append(out, child)
 			}
-			if !entry.IsDir() {
+			if !entry.IsDir() || isReparse {
 				continue
 			}
 			childDepth := current.depth + 1
@@ -450,16 +457,19 @@ func windowsEnsureSharedDescendantCoverage(config WindowsSandboxCommandConfig) e
 			}
 			return fmt.Errorf("stat shared deny root %s: %w", group.Path, err)
 		}
-		if _, _, err := applyWindowsACLPathGroup(group); err != nil {
-			denied, denyErr := windowsPathDeniesCapabilitySID(group.Path, denySID)
-			if denyErr != nil {
-				return denyErr
+		rootDenied, checkErr := windowsPathDeniesCapabilitySID(group.Path, denySID)
+		if checkErr != nil {
+			return checkErr
+		}
+		if !rootDenied {
+			if _, _, err := applyWindowsACLPathGroup(group); err != nil {
+				denied, denyErr := windowsPathDeniesCapabilitySID(group.Path, denySID)
+				if denyErr != nil || !denied {
+					return fmt.Errorf("shared root write deny missing on %s: %w", group.Path, err)
+				}
+				// Reapply failed but the root's own deny is still effectively in
+				// place, so the write jail continues to hold for this root.
 			}
-			if !denied {
-				return fmt.Errorf("shared root write deny missing on %s: %w", group.Path, err)
-			}
-			// Reapply failed but the root's own deny is still effectively in
-			// place, so the write jail continues to hold for this root.
 		}
 		if _, err := applyWindowsSharedDescendantDenies(group.Path, denySID, writeRoots); err == nil {
 			continue
@@ -520,6 +530,7 @@ func windowsPathDeniesCapabilitySID(path, wantSID string) (bool, error) {
 	if dacl == nil {
 		return false, nil
 	}
+	var deniedMask windows.ACCESS_MASK
 	for index := uint16(0); index < dacl.AceCount; index++ {
 		var ace *windows.ACCESS_ALLOWED_ACE
 		if err := windows.GetAce(dacl, uint32(index), &ace); err != nil {
@@ -537,19 +548,15 @@ func windowsPathDeniesCapabilitySID(path, wantSID string) (bool, error) {
 			continue
 		}
 		sid, ok := windowsAceSID(ace)
-		if !ok {
+		if !ok || !sid.Equals(want) {
 			continue
 		}
-		if !sid.Equals(want) {
-			continue
-		}
-		// Require the deny to actually cover write-relevant bits: a deny ACE
-		// for wantSID that only denies, e.g., read/execute (the DenyRead
-		// shape) does not close the write-jail escape this function exists to
-		// detect, and must not be reported as an existing write deny.
-		if ace.Mask&windowsBroadenedWriteProbeMask != 0 {
-			return true, nil
-		}
+		deniedMask |= ace.Mask
 	}
-	return false, nil
+	// Require the deny to cover essential write-relevant bits (FILE_WRITE_DATA and
+	// FILE_APPEND_DATA): a deny ACE for wantSID that only denies e.g. attributes
+	// or read/execute does not close the write-jail escape and must not be
+	// reported as a complete write deny.
+	const essentialWriteMask = windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA
+	return (deniedMask & essentialWriteMask) == essentialWriteMask, nil
 }
