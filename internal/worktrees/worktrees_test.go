@@ -1747,13 +1747,13 @@ func TestParseWorktreeListTracksLockedState(t *testing.T) {
 	if len(entries) != 3 {
 		t.Fatalf("expected 3 entries, got %d: %#v", len(entries), entries)
 	}
-	if entries[0].path != filepath.Clean("/a/one") || entries[0].locked {
+	if entries[0].path != canonicalizePath("/a/one") || entries[0].locked {
 		t.Errorf("entries[0] = %#v", entries[0])
 	}
-	if entries[1].path != filepath.Clean("/a/two") || !entries[1].locked {
+	if entries[1].path != canonicalizePath("/a/two") || !entries[1].locked {
 		t.Errorf("entries[1] = %#v", entries[1])
 	}
-	if entries[2].path != filepath.Clean("/a/three") || !entries[2].locked {
+	if entries[2].path != canonicalizePath("/a/three") || !entries[2].locked {
 		t.Errorf("entries[2] = %#v", entries[2])
 	}
 }

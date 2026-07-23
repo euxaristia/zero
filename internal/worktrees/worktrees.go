@@ -904,7 +904,7 @@ func parseWorktreeList(output string) []worktreeEntry {
 			if current != nil {
 				entries = append(entries, *current)
 			}
-			current = &worktreeEntry{path: filepath.Clean(strings.TrimPrefix(line, "worktree "))}
+			current = &worktreeEntry{path: canonicalizePath(strings.TrimPrefix(line, "worktree "))}
 		case current != nil && (line == "locked" || strings.HasPrefix(line, "locked ")):
 			current.locked = true
 			current.lockReason = strings.TrimSpace(strings.TrimPrefix(line, "locked"))
