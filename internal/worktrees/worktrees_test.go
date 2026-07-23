@@ -1757,3 +1757,96 @@ func TestParseWorktreeListTracksLockedState(t *testing.T) {
 		t.Errorf("entries[2] = %#v", entries[2])
 	}
 }
+
+func TestCleanUnlocksExpiredLeaseBeforePruningMissingDir(t *testing.T) {
+	deadPID := deadProcessPID(t)
+	tempDir := t.TempDir()
+	baseDir := filepath.Join(tempDir, "zero-worktrees")
+	repoRoot := filepath.Join(tempDir, "repo")
+	if err := os.MkdirAll(repoRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	repoDir := filepath.Join(baseDir, "zero-worktree-"+repoKey(repoRoot))
+	missingPath := filepath.Join(repoDir, "missing-dead-task")
+
+	runner := &fakeRunner{
+		results: []CommandResult{
+			{Stdout: repoRoot},
+			{Stdout: "worktree " + repoRoot + "\nworktree " + missingPath + "\nlocked " + leaseReason(deadPID) + "\n"},
+			{ExitCode: 0}, // unlock
+			{ExitCode: 0}, // prune
+		},
+	}
+
+	if err := Clean(context.Background(), Options{Cwd: repoRoot, BaseDir: baseDir, RunGit: runner.Run}, 24*time.Hour); err != nil {
+		t.Fatalf("Clean failed: %v", err)
+	}
+
+	unlocked := false
+	pruned := false
+	for _, call := range runner.calls {
+		if len(call.args) >= 2 && call.args[0] == "worktree" {
+			if call.args[1] == "unlock" {
+				unlocked = true
+			}
+			if call.args[1] == "prune" {
+				pruned = true
+			}
+		}
+	}
+	if !unlocked || !pruned {
+		t.Errorf("expected unlock and prune for missing expired lease, unlocked=%v, pruned=%v, calls=%#v", unlocked, pruned, runner.calls)
+	}
+}
+
+func TestCleanMigratesAndReclaimsLegacyZeroWorktrees(t *testing.T) {
+	tempDir := t.TempDir()
+	baseDir := filepath.Join(tempDir, "zero-worktrees")
+	repoRoot := filepath.Join(tempDir, "repo")
+	repoDir := filepath.Join(baseDir, "zero-worktree-"+repoKey(repoRoot))
+
+	legacyPath := filepath.Join(repoDir, "legacy-task")
+	if err := os.MkdirAll(legacyPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(repoRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Note: plantOwnershipMarker is explicitly NOT called here, simulating a pre-upgrade worktree
+	twoDaysAgo := time.Now().Add(-48 * time.Hour)
+	if err := filepath.WalkDir(legacyPath, func(path string, _ os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		return os.Chtimes(path, twoDaysAgo, twoDaysAgo)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &fakeRunner{
+		autoAbsoluteGitDir: true,
+		results: []CommandResult{
+			{Stdout: repoRoot},
+			{Stdout: "worktree " + repoRoot + "\nworktree " + legacyPath + "\n"},
+			{ExitCode: 0},               // status --porcelain --ignored: clean
+			{Stdout: "deadbeef"},        // rev-parse HEAD
+			{Stdout: "refs/heads/main"}, // for-each-ref --contains (reachable)
+			{ExitCode: 0},               // worktree remove --force
+			{ExitCode: 0},               // worktree prune
+		},
+	}
+
+	if err := Clean(context.Background(), Options{Cwd: repoRoot, BaseDir: baseDir, RunGit: runner.Run}, 24*time.Hour); err != nil {
+		t.Fatalf("Clean failed: %v", err)
+	}
+
+	removed := false
+	for _, call := range runner.calls {
+		if len(call.args) >= 2 && call.args[0] == "worktree" && call.args[1] == "remove" {
+			removed = true
+		}
+	}
+	if !removed {
+		t.Fatal("Clean did not reclaim a legacy pre-upgrade Zero worktree lacking an ownership marker")
+	}
+}

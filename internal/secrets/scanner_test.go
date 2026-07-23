@@ -139,6 +139,24 @@ func TestScanDetectsHyphenatedOpenAICompatibleKeys(t *testing.T) {
 	}
 }
 
+func TestScanDetectsAnthropicKeys(t *testing.T) {
+	for _, key := range []string{
+		"sk-ant-api03-1234567890abcdefghijklmnopqrstuvwxyz-12345",
+		"sk-ant-1234567890abcdefghijklmnopqrstuvwxyz-12345",
+	} {
+		redacted, findings := Redact("token=" + key)
+		if len(findings) != 1 || findings[0].Type != "openai_key" {
+			t.Fatalf("expected one openai_key finding for %q, got %#v", key, findings)
+		}
+		if strings.Contains(redacted, key) {
+			t.Fatalf("key leaked after redaction: %q", redacted)
+		}
+		if !strings.Contains(redacted, "[REDACTED:openai_key]") {
+			t.Fatalf("missing typed placeholder for %q: %q", key, redacted)
+		}
+	}
+}
+
 func TestScanRedactsLongerKeysWithoutTailLeak(t *testing.T) {
 	cases := []struct {
 		wantType string

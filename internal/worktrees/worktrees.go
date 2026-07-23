@@ -159,7 +159,8 @@ func Prepare(ctx context.Context, options Options) (Result, error) {
 		}
 		result.LockAcquired = true
 		if err := writeOwnershipMarker(ctx, runGit, target); err != nil {
-			return Result{}, err
+			_, unlockErr := gitOutput(ctx, runGit, repoRoot, "worktree", "unlock", target)
+			return Result{}, errors.Join(err, unlockErr)
 		}
 		return result, nil
 	}
@@ -209,7 +210,9 @@ func Prepare(ctx context.Context, options Options) (Result, error) {
 	}
 	result.LockAcquired = true
 	if err := writeOwnershipMarker(ctx, runGit, target); err != nil {
-		return Result{}, err
+		_, unlockErr := gitOutput(ctx, runGit, repoRoot, "worktree", "unlock", target)
+		_, removeErr := gitOutput(ctx, runGit, repoRoot, "worktree", "remove", "--force", target)
+		return Result{}, errors.Join(err, unlockErr, removeErr)
 	}
 	return result, nil
 }
@@ -373,6 +376,24 @@ func hasOwnershipMarker(ctx context.Context, runGit GitRunner, target string) (b
 		return false, fmt.Errorf("read worktree ownership marker: %w", err)
 	}
 	return string(content) == zeroOwnerMarkerContent, nil
+}
+
+// isLegacyZeroWorktree verifies whether a worktree lacking zero-owner was
+// created by a pre-upgrade version of Zero for this repository.
+func isLegacyZeroWorktree(ctx context.Context, runGit GitRunner, target string, repoDir string, entry worktreeEntry) bool {
+	if !isUnderDir(canonicalizePath(target), repoDir) {
+		return false
+	}
+	if entry.locked {
+		if !strings.HasPrefix(strings.TrimSpace(entry.lockReason), leaseReasonPrefix) {
+			return false
+		}
+	}
+	gitDir, err := gitOutput(ctx, runGit, target, "rev-parse", "--absolute-git-dir")
+	if err != nil || strings.TrimSpace(gitDir) == "" {
+		return false
+	}
+	return true
 }
 
 // verifyZeroOwnedWorktree confirms path has a zero-worktree-<repoKey> ancestor
@@ -817,6 +838,9 @@ func Clean(ctx context.Context, options Options, maxAge time.Duration) error {
 		}
 		if err != nil {
 			if os.IsNotExist(err) {
+				if expiredLease {
+					_, _ = gitOutput(ctx, runGit, repoRoot, "worktree", "unlock", entry.path)
+				}
 				_, _ = runGit(ctx, repoRoot, "worktree", "prune")
 			}
 			continue
@@ -841,16 +865,22 @@ func Clean(ctx context.Context, options Options, maxAge time.Duration) error {
 				// gets committed/cleaned (no longer dirty) or unlocked.
 				continue
 			}
-			// The zero-worktree-<repoKey> path and (for the expired-lease
-			// branch above) the leaseReasonPrefix lock reason are both public
-			// conventions a user can reproduce by hand for a worktree of the
-			// same repository; neither is proof Zero created this one.
 			// Require the ownership marker Prepare itself persists before
-			// force-touching anything below. Any failure to verify it
-			// (including the marker simply being absent) is treated the same
-			// as "not ours": skip it, the same fail-closed stance as an
-			// unreadable worktree above.
-			if owned, err := hasOwnershipMarker(ctx, runGit, statPath); err != nil || !owned {
+			// force-touching anything below. For legacy Zero worktrees created
+			// before markers existed, verify they are in repoDir with a Zero
+			// lease and migrate them by writing the marker.
+			owned, err := hasOwnershipMarker(ctx, runGit, statPath)
+			if err != nil {
+				continue
+			}
+			if !owned {
+				if isLegacyZeroWorktree(ctx, runGit, statPath, repoDir, entry) {
+					if writeErr := writeOwnershipMarker(ctx, runGit, statPath); writeErr == nil {
+						owned = true
+					}
+				}
+			}
+			if !owned {
 				continue
 			}
 			if err := preserveUnreachableWorktreeHead(ctx, runGit, repoRoot, statPath); err != nil {
