@@ -461,7 +461,7 @@ var dunePalette = palette{
 	addBgWord: "#007400", // word-level added span — quantizes to xterm green #008700, distinct from both addBg's #005f00 and delBgWord's red
 	delBgWord: "#740000", // word-level removed span — quantizes to xterm red #870000 (see addBgWord)
 	permBg:    "#1c1915",
-	selBg:     "#191c1f", // selection — near-black, distinct from panel, AA with faint/faintest
+	selBg:     "#262626", // selection — dark gray, distinct from panel (>= 1.10 contrast after xterm-256 quantization), AA with faint/faintest
 	addInk:    "#f0f5d2", // changed-word text — lightened so it still clears AA (4.60:1) against addBgWord's xterm-256 quantized #008700 (the original #bdeed7 fell to 4.06:1)
 	delInk:    "#f2c4c4",
 	onAccent:  "#000000",

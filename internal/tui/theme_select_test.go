@@ -429,6 +429,9 @@ func TestExtendedThemeANSI256Contrast(t *testing.T) {
 	}
 
 	dune := palettes["dune"]
+	if sep := wcagRatio(t, q(dune.selBg), q(dune.panel)); sep < 1.10 {
+		t.Errorf("dune: selBg vs panel separation %.2f < 1.10 after xterm-256 quantization (%s vs %s)", sep, q(dune.selBg), q(dune.panel))
+	}
 	for _, pair := range []struct{ name, fg, bg string }{
 		{"accent on selBg", dune.accent, dune.selBg},
 		{"blue on selBg", dune.blue, dune.selBg},
