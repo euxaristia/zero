@@ -99,16 +99,11 @@ var (
 // attributes in (or the security of) a directory, i.e. the bits that make a
 // directory a usable write-jail escape. FILE_WRITE_DATA is FILE_ADD_FILE and
 // FILE_APPEND_DATA is FILE_ADD_SUBDIRECTORY for a directory object.
-const windowsBroadenedWriteProbeMask windows.ACCESS_MASK = windows.FILE_WRITE_DATA |
-	windows.FILE_APPEND_DATA |
-	windows.FILE_WRITE_ATTRIBUTES |
-	windows.FILE_WRITE_EA |
+const windowsBroadenedWriteProbeMask windows.ACCESS_MASK = windows.FILE_GENERIC_WRITE |
 	windowsFileDeleteChild |
 	windows.DELETE |
 	windows.WRITE_DAC |
-	windows.WRITE_OWNER |
-	windows.GENERIC_WRITE |
-	windows.GENERIC_ALL
+	windows.WRITE_OWNER
 
 // applyWindowsSharedDescendantDenies enumerates the existing writable
 // descendants of a shared root and applies a direct, non-inheriting DenyWrite
@@ -195,8 +190,7 @@ func windowsEnumerateWritableDescendants(root string, writeRoots []string) ([]st
 		queue = queue[1:]
 		entries, err := os.ReadDir(current.path)
 		if err != nil {
-			if os.IsPermission(err) {
-				// skip with a debug log rather than failing
+			if windowsPathIsDriveRootPath(filepath.Dir(current.path)) && windowsDescendantScanNameIsSystemLocked(filepath.Base(current.path)) {
 				continue
 			}
 			return nil, fmt.Errorf("list descendants of %s: %w", current.path, err)
