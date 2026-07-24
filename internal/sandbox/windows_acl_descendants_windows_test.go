@@ -120,7 +120,7 @@ func denyUsersWrite(t *testing.T, path string) {
 	if err != nil {
 		t.Fatalf("DACL %s: %v", path, err)
 	}
-	denyMask := windowsBroadenedWriteProbeMask &^ (windows.GENERIC_WRITE | windows.GENERIC_ALL)
+	denyMask := windowsBroadenedWriteProbeMask &^ (windows.GENERIC_WRITE | windows.GENERIC_ALL | windows.SYNCHRONIZE)
 	newDACL, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{{
 		AccessPermissions: denyMask,
 		AccessMode:        windows.DENY_ACCESS,
@@ -305,6 +305,10 @@ func setSelfListDirectoryAccess(t *testing.T, path string, deny bool) {
 	if err != nil {
 		t.Fatalf("DACL %s: %v", path, err)
 	}
+	var targetOldDACL *windows.ACL = oldDACL
+	if deny {
+		targetOldDACL = nil
+	}
 	newDACL, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{{
 		AccessPermissions: permissions,
 		AccessMode:        mode,
@@ -314,7 +318,7 @@ func setSelfListDirectoryAccess(t *testing.T, path string, deny bool) {
 			TrusteeType:  windows.TRUSTEE_IS_USER,
 			TrusteeValue: windows.TrusteeValueFromSID(selfUserSID(t)),
 		},
-	}}, oldDACL)
+	}}, targetOldDACL)
 	if err != nil {
 		t.Fatalf("ACLFromEntries %s: %v", path, err)
 	}
