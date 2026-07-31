@@ -202,9 +202,6 @@ func windowsEnumerateWritableDescendants(root string, writeRoots []string) ([]st
 				continue
 			}
 			isReparse := (entry.Type()&os.ModeSymlink != 0) || (entry.Type()&os.ModeIrregular != 0)
-			if isReparse {
-				return nil, fmt.Errorf("reparse point %s cannot be verified for descendant write coverage", child)
-			}
 			if visited >= windowsDescendantScanMaxDirs {
 				return nil, fmt.Errorf("descendant scan exceeded %d entries below %s", windowsDescendantScanMaxDirs, root)
 			}
@@ -222,7 +219,7 @@ func windowsEnumerateWritableDescendants(root string, writeRoots []string) ([]st
 			if writable {
 				out = append(out, child)
 			}
-			if !entry.IsDir() {
+			if isReparse || !entry.IsDir() {
 				continue
 			}
 			childDepth := current.depth + 1

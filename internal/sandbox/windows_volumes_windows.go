@@ -109,9 +109,6 @@ func windowsVolumeMountsOnlySystemDrive(volumeName, systemDrive string) (bool, e
 	}
 
 	mountPaths := windowsSplitNulList(buf)
-	if len(mountPaths) == 0 {
-		return true, nil
-	}
 	return windowsMountPathsAreOnlySystemDrive(mountPaths, systemDrive), nil
 }
 
