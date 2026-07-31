@@ -102,7 +102,7 @@ func TestResolveConfigKimiCodeStripsExtraHeadersOnEndpointOverride(t *testing.T)
 
 	// Overridden to non-canonical host: ExtraHeaders must be empty
 	cfgOverride, _, err := r.ResolveConfig("kimi-code", map[string]string{
-		"ZERO_OAUTH_ALLOW_PRESETS":      "1",
+		"ZERO_OAUTH_ALLOW_PRESETS":       "1",
 		"ZERO_OAUTH_KIMI_CODE_TOKEN_URL": "https://my-custom-proxy.example.com/oauth/token",
 	})
 	if err != nil {

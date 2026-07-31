@@ -51,8 +51,8 @@ func Headers() map[string]string {
 }
 
 var (
-	deviceIDMu       sync.Mutex
-	cachedDeviceID   = sync.OnceValue(func() string { return loadOrCreateDeviceIDAt(deviceIDPath()) })
+	deviceIDMu     sync.Mutex
+	cachedDeviceID = sync.OnceValue(func() string { return loadOrCreateDeviceIDAt(deviceIDPath()) })
 )
 
 // DeviceID returns the persistent device identifier sent as X-Msh-Device-Id.
@@ -75,8 +75,6 @@ func ResetDeviceIDForTest() {
 	cachedDeviceID = sync.OnceValue(func() string { return loadOrCreateDeviceIDAt(deviceIDPath()) })
 	deviceIDMu.Unlock()
 }
-
-
 
 // loadOrCreateDeviceIDAt is the real load-or-create logic behind DeviceID,
 // parameterized by the storage path so tests can exercise production code
