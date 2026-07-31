@@ -366,7 +366,7 @@ func windowsACLAccess(action WindowsACLAction) (windows.ACCESS_MODE, windows.ACC
 	case WindowsACLDenyRead:
 		return windows.DENY_ACCESS, windows.FILE_GENERIC_READ | windows.FILE_GENERIC_EXECUTE, nil
 	case WindowsACLDenyWrite:
-		return windows.DENY_ACCESS, windows.FILE_GENERIC_WRITE | windows.DELETE | windowsFileDeleteChild | windows.WRITE_DAC | windows.WRITE_OWNER, nil
+		return windows.DENY_ACCESS, (windows.FILE_GENERIC_WRITE | windows.DELETE | windowsFileDeleteChild | windows.WRITE_DAC | windows.WRITE_OWNER) &^ windows.SYNCHRONIZE, nil
 	case WindowsACLRevokeCapability:
 		// SetEntriesInAclW's REVOKE_ACCESS mode is documented to strip a
 		// trustee's existing ACEs, but empirically (verified against this

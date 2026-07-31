@@ -99,11 +99,11 @@ var (
 // attributes in (or the security of) a directory, i.e. the bits that make a
 // directory a usable write-jail escape. FILE_WRITE_DATA is FILE_ADD_FILE and
 // FILE_APPEND_DATA is FILE_ADD_SUBDIRECTORY for a directory object.
-const windowsBroadenedWriteProbeMask windows.ACCESS_MASK = windows.FILE_GENERIC_WRITE |
+const windowsBroadenedWriteProbeMask windows.ACCESS_MASK = (windows.FILE_GENERIC_WRITE |
 	windowsFileDeleteChild |
 	windows.DELETE |
 	windows.WRITE_DAC |
-	windows.WRITE_OWNER
+	windows.WRITE_OWNER) &^ windows.SYNCHRONIZE
 
 // applyWindowsSharedDescendantDenies enumerates the existing writable
 // descendants of a shared root and applies a direct, non-inheriting DenyWrite
@@ -203,7 +203,7 @@ func windowsEnumerateWritableDescendants(root string, writeRoots []string) ([]st
 			}
 			isReparse := (entry.Type()&os.ModeSymlink != 0) || (entry.Type()&os.ModeIrregular != 0)
 			if isReparse {
-				continue
+				return nil, fmt.Errorf("reparse point %s cannot be verified for descendant write coverage", child)
 			}
 			if visited >= windowsDescendantScanMaxDirs {
 				return nil, fmt.Errorf("descendant scan exceeded %d entries below %s", windowsDescendantScanMaxDirs, root)

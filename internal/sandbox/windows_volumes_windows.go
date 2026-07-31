@@ -108,7 +108,11 @@ func windowsVolumeMountsOnlySystemDrive(volumeName, systemDrive string) (bool, e
 		return false, err
 	}
 
-	return windowsMountPathsAreOnlySystemDrive(windowsSplitNulList(buf), systemDrive), nil
+	mountPaths := windowsSplitNulList(buf)
+	if len(mountPaths) == 0 {
+		return true, nil
+	}
+	return windowsMountPathsAreOnlySystemDrive(mountPaths, systemDrive), nil
 }
 
 // windowsSplitNulList splits the double-NUL-terminated UTF-16 string list

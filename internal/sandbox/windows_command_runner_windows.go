@@ -122,6 +122,7 @@ func runWindowsSandboxCommand(config WindowsSandboxCommandConfig, stderr io.Writ
 	// in microseconds against a command that was already about to run inside
 	// the write jail, not a passive gap an attacker can wait out.
 	broadenReadSIDs := config.SandboxLevel == WindowsSandboxLevelRestrictedToken && !writeRestricted &&
+		NormalizeNetworkMode(config.PermissionProfile.Network.Mode) != NetworkAllow &&
 		windowsSystemDriveIsOnlyFixedVolume()
 	if broadenReadSIDs {
 		// The shared-directory DenyWrite mitigation names the one stable
