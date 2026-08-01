@@ -262,7 +262,7 @@ func applyWindowsACLPathGroup(group windowsACLPathGroup) (windowsACLSnapshot, bo
 	if err != nil {
 		return fail(fmt.Errorf("read windows DACL for %s: %w", path, err))
 	}
-	accessEntries, err := windowsExplicitAccessEntries(group.Entries, isDir)
+	accessEntries, err := windowsExplicitAccessEntries(group.Entries, isDir, oldDACL)
 	if err != nil {
 		return fail(err)
 	}
@@ -330,12 +330,37 @@ func windowsACLGroupRequiresExistingTarget(group windowsACLPathGroup) bool {
 	return false
 }
 
-func windowsExplicitAccessEntries(entries []WindowsACLEntry, isDir bool) ([]windows.EXPLICIT_ACCESS, error) {
+func windowsExplicitAccessEntries(entries []WindowsACLEntry, isDir bool, oldDACL *windows.ACL) ([]windows.EXPLICIT_ACCESS, error) {
 	out := make([]windows.EXPLICIT_ACCESS, 0, len(entries))
 	for _, entry := range entries {
 		sid, err := windows.StringToSid(entry.Capability)
 		if err != nil {
 			return nil, fmt.Errorf("parse windows capability SID %q: %w", entry.Capability, err)
+		}
+		if entry.Action == WindowsACLRevokeCapability {
+			// Migration cleanup for hosts that ran experimental SID-broadening
+			// builds: strip the synthetic full DenyWrite ACE for this SID, but
+			// re-emit any co-resident DenyRead ACEs for the same stable SID so
+			// a concurrent profile's read boundary is not deleted (jatmn P1).
+			// SET_ACCESS with a zero mask clears every ACE for the trustee
+			// (REVOKE_ACCESS leaves DENY ACEs untouched empirically); the
+			// preserved read-deny entries that follow restore DenyRead only.
+			out = append(out, windows.EXPLICIT_ACCESS{
+				AccessPermissions: 0,
+				AccessMode:        windows.SET_ACCESS,
+				Inheritance:       0,
+				Trustee: windows.TRUSTEE{
+					TrusteeForm:  windows.TRUSTEE_IS_SID,
+					TrusteeType:  windows.TRUSTEE_IS_GROUP,
+					TrusteeValue: windows.TrusteeValueFromSID(sid),
+				},
+			})
+			preserved, err := windowsPreservedReadDenyAccessEntries(oldDACL, sid, isDir)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, preserved...)
+			continue
 		}
 		accessMode, permissions, err := windowsACLAccess(entry.Action)
 		if err != nil {
@@ -359,6 +384,75 @@ func windowsExplicitAccessEntries(entries []WindowsACLEntry, isDir bool) ([]wind
 	return out, nil
 }
 
+// windowsPreservedReadDenyAccessEntries returns DENY_ACCESS EXPLICIT_ACCESS
+// entries that re-apply any non-write-related DENY ACEs for wantSID from
+// oldDACL. Write-related DENY ACEs (the experimental shared/descendant
+// DenyWrite shape) are intentionally omitted so migration revoke can drop
+// them without also clearing a live DenyRead for the same SID.
+func windowsPreservedReadDenyAccessEntries(oldDACL *windows.ACL, wantSID *windows.SID, isDir bool) ([]windows.EXPLICIT_ACCESS, error) {
+	if oldDACL == nil || wantSID == nil {
+		return nil, nil
+	}
+	var out []windows.EXPLICIT_ACCESS
+	for index := uint16(0); index < oldDACL.AceCount; index++ {
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if err := windows.GetAce(oldDACL, uint32(index), &ace); err != nil {
+			return nil, fmt.Errorf("read ACE %d while preserving read deny: %w", index, err)
+		}
+		if ace.Header.AceType != windows.ACCESS_DENIED_ACE_TYPE && ace.Header.AceType != windowsAccessDeniedObjectAceType {
+			continue
+		}
+		if ace.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0 {
+			continue
+		}
+		sid, ok := windowsAceSID(ace)
+		if !ok || !sid.Equals(wantSID) {
+			continue
+		}
+		if windowsIsExperimentalWriteDenyMask(ace.Mask) {
+			continue
+		}
+		// Preserve non-write DENY ACEs (typically DenyRead for the stable
+		// sandbox-home ReadOnly SID).
+		inheritance := uint32(0)
+		if isDir && ace.Header.AceFlags&(windows.OBJECT_INHERIT_ACE|windows.CONTAINER_INHERIT_ACE) != 0 {
+			inheritance = windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT
+		}
+		out = append(out, windows.EXPLICIT_ACCESS{
+			AccessPermissions: ace.Mask,
+			AccessMode:        windows.DENY_ACCESS,
+			Inheritance:       inheritance,
+			Trustee: windows.TRUSTEE{
+				TrusteeForm:  windows.TRUSTEE_IS_SID,
+				TrusteeType:  windows.TRUSTEE_IS_GROUP,
+				TrusteeValue: windows.TrusteeValueFromSID(wantSID),
+			},
+		})
+	}
+	return out, nil
+}
+
+// windowsIsExperimentalWriteDenyMask reports whether mask is a synthetic
+// DenyWrite (or partial write deny) from earlier broadening builds — the only
+// ACEs migration revoke may drop for the stable ReadOnly SID. Pure DenyRead
+// masks share some STANDARD_RIGHTS bits with FILE_GENERIC_WRITE, so this keys
+// off content-write / delete / DAC bits that DenyRead never carries.
+func windowsIsExperimentalWriteDenyMask(mask windows.ACCESS_MASK) bool {
+	_, writeMask, err := windowsACLAccess(WindowsACLDenyWrite)
+	if err != nil {
+		return false
+	}
+	if mask&writeMask == writeMask {
+		return true
+	}
+	// Content-write / ownership bits unique to write denies (not in DenyRead's
+	// FILE_GENERIC_READ|FILE_GENERIC_EXECUTE mask alone).
+	const writeContent = windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA |
+		windows.FILE_WRITE_EA | windows.FILE_WRITE_ATTRIBUTES |
+		windowsFileDeleteChild | windows.DELETE | windows.WRITE_DAC | windows.WRITE_OWNER
+	return mask&writeContent != 0
+}
+
 func windowsACLAccess(action WindowsACLAction) (windows.ACCESS_MODE, windows.ACCESS_MASK, error) {
 	switch action {
 	case WindowsACLAllowWrite:
@@ -368,14 +462,7 @@ func windowsACLAccess(action WindowsACLAction) (windows.ACCESS_MODE, windows.ACC
 	case WindowsACLDenyWrite:
 		return windows.DENY_ACCESS, (windows.FILE_GENERIC_WRITE | windows.DELETE | windowsFileDeleteChild | windows.WRITE_DAC | windows.WRITE_OWNER) &^ windows.SYNCHRONIZE, nil
 	case WindowsACLRevokeCapability:
-		// SetEntriesInAclW's REVOKE_ACCESS mode is documented to strip a
-		// trustee's existing ACEs, but empirically (verified against this
-		// exact code path) it leaves a pre-existing DENY ACE for the trustee
-		// untouched — the merge simply has nothing to OR into and no ACE gets
-		// added or removed. SET_ACCESS with a zero mask does what REVOKE_ACCESS
-		// is supposed to: it replaces the trustee's entry outright, and
-		// SetEntriesInAclW omits an ACE entirely for a zero-permission SET,
-		// which is what actually clears a stale allow OR deny ACE for this SID.
+		// Handled specially in windowsExplicitAccessEntries (preserve DenyRead).
 		return windows.SET_ACCESS, 0, nil
 	default:
 		return 0, 0, fmt.Errorf("unsupported windows ACL action %q", action)

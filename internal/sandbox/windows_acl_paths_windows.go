@@ -22,7 +22,9 @@ import (
 // state and spoofable by anything that can influence the elevated setup
 // process.
 func resolveWindowsSharedDenyPaths() (systemDrive, systemRoot, programData, publicDir string, err error) {
-	windowsDir, err := windows.GetSystemWindowsDirectory()
+	// GetWindowsDirectory is the long-standing x/sys export; GetSystemWindowsDirectory
+	// is not available on every pinned golang.org/x/sys revision CI may use.
+	windowsDir, err := windows.GetWindowsDirectory()
 	if err != nil {
 		return "", "", "", "", fmt.Errorf("resolve system windows directory: %w", err)
 	}

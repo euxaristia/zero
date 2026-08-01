@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -107,6 +108,120 @@ func TestApplyWindowsACLPathGroupRevokeCapabilityRemovesStaleDeny(t *testing.T) 
 	if dirDeniesSID(t, dir, staleSID) {
 		t.Fatalf("%q still carries the stale deny for %q after promotion to a write root", dir, staleSID)
 	}
+}
+
+// TestApplyWindowsACLRevokePreservesDenyRead pins that migration revoke for a
+// promoted write root removes only the experimental DenyWrite ACE for the
+// stable SID and leaves a co-resident DenyRead for the same SID intact — so a
+// concurrent profile's read boundary is not deleted (jatmn P1).
+func TestApplyWindowsACLRevokePreservesDenyRead(t *testing.T) {
+	// Synthetic capability SID (not a group this process is in) so DenyWrite's
+	// WRITE_DAC/DELETE bits do not lock the test out of its own temp dir.
+	caps, err := LoadOrCreateWindowsCapabilitySIDs(t.TempDir())
+	if err != nil {
+		t.Fatalf("LoadOrCreateWindowsCapabilitySIDs: %v", err)
+	}
+	sid := caps.ReadOnly
+	dir := t.TempDir()
+
+	// Profile A shape plus experimental broadening: both DenyRead and full
+	// DenyWrite for the same stable SID on one path (two ACEs in one apply so
+	// a second DENY_ACCESS merge cannot replace the first).
+	if _, _, err := applyWindowsACLPathGroup(windowsACLPathGroup{
+		Path: dir,
+		Entries: []WindowsACLEntry{
+			{
+				Action:     WindowsACLDenyRead,
+				Path:       dir,
+				Capability: sid,
+				NoInherit:  true,
+			},
+			{
+				Action:     WindowsACLDenyWrite,
+				Path:       dir,
+				Capability: sid,
+				NoInherit:  true,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("apply DenyRead+DenyWrite: %v", err)
+	}
+	writeDenied, err := windowsPathDeniesCapabilitySID(dir, sid)
+	if err != nil {
+		t.Fatalf("windowsPathDeniesCapabilitySID before: %v", err)
+	}
+	if !writeDenied {
+		t.Fatal("fixture: expected full write deny present before revoke")
+	}
+	if !dirDeniesReadSID(t, dir, sid) {
+		t.Fatal("fixture: expected read deny present before revoke")
+	}
+
+	// Profile B promotes dir to a write root: revoke stale write deny only.
+	if _, _, err := applyWindowsACLPathGroup(windowsACLPathGroup{
+		Path: dir,
+		Entries: []WindowsACLEntry{{
+			Action:     WindowsACLRevokeCapability,
+			Path:       dir,
+			Capability: sid,
+			NoInherit:  true,
+		}},
+	}); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	writeDenied, err = windowsPathDeniesCapabilitySID(dir, sid)
+	if err != nil {
+		t.Fatalf("windowsPathDeniesCapabilitySID after: %v", err)
+	}
+	if writeDenied {
+		t.Fatal("write deny for SID still present after migration revoke")
+	}
+	if !dirDeniesReadSID(t, dir, sid) {
+		t.Fatal("DenyRead for same SID was removed by migration revoke; read boundary must be preserved")
+	}
+}
+
+// dirDeniesReadSID reports whether path's DACL has a DENY ACE for wantSID whose
+// mask covers FILE_GENERIC_READ (DenyRead shape) without the full write-probe
+// mask of experimental DenyWrite.
+func dirDeniesReadSID(t *testing.T, path, wantSID string) bool {
+	t.Helper()
+	want, err := windows.StringToSid(wantSID)
+	if err != nil {
+		t.Fatalf("StringToSid %q: %v", wantSID, err)
+	}
+	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		t.Fatalf("GetNamedSecurityInfo %s: %v", path, err)
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		t.Fatalf("DACL %s: %v", path, err)
+	}
+	if dacl == nil {
+		return false
+	}
+	_, readMask, err := windowsACLAccess(WindowsACLDenyRead)
+	if err != nil {
+		t.Fatalf("windowsACLAccess DenyRead: %v", err)
+	}
+	for index := uint16(0); index < dacl.AceCount; index++ {
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if err := windows.GetAce(dacl, uint32(index), &ace); err != nil {
+			t.Fatalf("GetAce %d of %s: %v", index, path, err)
+		}
+		if ace.Header.AceType != windows.ACCESS_DENIED_ACE_TYPE {
+			continue
+		}
+		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+		if !sid.Equals(want) {
+			continue
+		}
+		if ace.Mask&readMask == readMask && !windowsIsExperimentalWriteDenyMask(ace.Mask) {
+			return true
+		}
+	}
+	return false
 }
 
 // A materialized target that does not exist yet is created, ACL'd through the
