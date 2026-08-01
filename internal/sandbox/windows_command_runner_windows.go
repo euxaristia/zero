@@ -14,6 +14,14 @@ func runWindowsSandboxCommand(config WindowsSandboxCommandConfig, stderr io.Writ
 			fmt.Fprintln(stderr, WindowsSandboxCommandRunnerName+": "+err.Error())
 			return 1
 		}
+		// Fully restricted DenyRead tokens cannot load ordinary Users-granted
+		// system binaries without SID broadening; broadening is permanently
+		// off because it admits write grants outside WriteRoots. Reject before
+		// launch until access-time confinement exists (PR #640).
+		if err := windowsDenyReadRestrictedTokenUnsupported(config); err != nil {
+			fmt.Fprintln(stderr, WindowsSandboxCommandRunnerName+": "+err.Error())
+			return 1
+		}
 	case WindowsSandboxLevelUnelevated:
 		if err := ensureWindowsUnelevatedSetup(config); err != nil {
 			fmt.Fprintln(stderr, WindowsSandboxCommandRunnerName+": "+err.Error())
@@ -69,29 +77,15 @@ func runWindowsSandboxCommand(config WindowsSandboxCommandConfig, stderr io.Writ
 	// this has no in-token fix; preflight blocking and output hints live in
 	// internal/tools/shell_runtime.go.
 	tokenSIDs := windowsRuntimeTokenSIDs(capabilitySIDs, offlineSID, config.PermissionProfile.Network.Mode)
-	// A WRITE_RESTRICTED token keeps reads unrestricted so sandboxed commands
-	// can actually launch executables; it is only unsafe when DenyRead paths
-	// are configured, because the kernel skips restricted-SID deny ACEs for
-	// reads under that flag (#612). Profiles with DenyRead keep the fully
-	// restricted token, trading spawn capability for read-deny enforcement.
+	// WRITE_RESTRICTED keeps reads unrestricted so sandboxed commands can load
+	// Users-granted executables. It is only used when DenyRead is empty (#612:
+	// WRITE_RESTRICTED skips restricted-SID deny ACEs for reads). DenyRead on
+	// the restricted-token tier is rejected above rather than launching a fully
+	// restricted narrow-SID token that cannot execute normal tools.
 	writeRestricted := len(config.PermissionProfile.FileSystem.DenyRead) == 0
-	// Users/Authenticated Users SID broadening is permanently disabled.
-	//
-	// Adding those groups to the restricted-SID list would let the sandboxed
-	// process execute binaries under Program Files / Windows (which grant
-	// Users rather than Everyone), but the same restricted-SID match also
-	// unlocks every existing Users/AuthUsers write grant on the machine.
-	// Compensating DenyWrite ACEs applied from a preflight path walk cannot
-	// establish an access-time write boundary for the command's lifetime:
-	// reparse targets can hide writable children the walk never sees, and a
-	// normal process can create a group-writable child under a shared root
-	// after the scan (or after token creation) because the synthetic denies
-	// are deliberately non-inheriting. Until write confinement is enforced
-	// by the OS at open time (AppContainer/LPAC package identity with
-	// capability grants, or a path-policy sandbox API), keep the narrow
-	// restricting-SID set. DenyRead profiles may fail to launch ordinary
-	// system binaries as a result; that is preferred to a silent write-jail
-	// escape. See PR #640 review.
+	// Users/Authenticated Users SID broadening is permanently disabled: those
+	// groups unlock write grants outside WriteRoots, and preflight DenyWrite
+	// compensation cannot enforce an access-time write boundary. See PR #640.
 	const broadenReadSIDs = false
 	token, err := createWindowsRestrictedTokenForCapabilitySIDs(tokenSIDs, writeRestricted, broadenReadSIDs)
 	if err != nil {
