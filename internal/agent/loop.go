@@ -1778,11 +1778,15 @@ func toolResultFromPrePermissionReject(call ToolCall, result tools.Result) ToolR
 	}
 }
 
-// hooksSuppressed reports whether executable hooks must not run for this
-// run's permission mode. Plan mode promises a read-only turn, but hooks
-// execute configured host commands outside the advertised-tool and sandbox
-// gates, so dispatching them would let merely starting a plan session or
-// calling read_file mutate the workspace or spawn processes.
+// hooksSuppressed reports whether lifecycle and afterTool hooks must not run
+// for this run's permission mode. Plan mode promises a read-only turn, but
+// sessionStart, sessionEnd, and afterTool hooks execute configured host
+// commands outside the advertised-tool and sandbox gates, so dispatching them
+// would let merely starting or finishing a plan session mutate the workspace
+// or spawn processes.
+//
+// beforeTool is intentionally not gated here: fail-closed policy vetoes must
+// still apply to read-only plan-mode calls (see dispatchBeforeTool).
 //
 // Spec-draft keeps the existing trust-gated hook model: project hooks still
 // fire when the workspace (or its worktree trust root) is trusted. That is
@@ -1795,7 +1799,10 @@ func hooksSuppressed(options Options) bool {
 // dispatchBeforeTool runs configured beforeTool hooks for a tool call. A hook
 // that exits non-zero vetoes the call: the returned bool is true and the tool
 // must not run. A nil dispatcher (no hooks wired) is a no-op.
-// Note: beforeTool runs even in plan mode so fail-closed policy vetoes apply to read calls.
+//
+// beforeTool is not suppressed in plan mode: sessionStart/sessionEnd/afterTool
+// are gated by hooksSuppressed, but fail-closed policy vetoes must still apply
+// to the read-only tools plan mode advertises (e.g. read_file).
 func dispatchBeforeTool(ctx context.Context, options Options, call ToolCall, args map[string]any) (hooks.DispatchOutcome, bool) {
 	if options.Hooks == nil {
 		return hooks.DispatchOutcome{}, false
