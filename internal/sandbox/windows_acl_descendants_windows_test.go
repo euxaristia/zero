@@ -5,7 +5,9 @@ package sandbox
 import (
 	"encoding/binary"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"unsafe"
 
@@ -589,6 +591,114 @@ func TestWindowsPathDeniesCapabilitySIDRequiresEssentialWriteMask(t *testing.T) 
 	}
 }
 
+// denyCapabilityMask adds a direct (non-inheriting) deny ACE for capabilitySID
+// covering only mask. Used to build partial-deny fixtures that must not pass
+// windowsPathDeniesCapabilitySID's complete-coverage check.
+func denyCapabilityMask(t *testing.T, path, capabilitySID string, mask windows.ACCESS_MASK) {
+	t.Helper()
+	sid, err := windows.StringToSid(capabilitySID)
+	if err != nil {
+		t.Fatalf("StringToSid(%q): %v", capabilitySID, err)
+	}
+	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		t.Fatalf("GetNamedSecurityInfo %s: %v", path, err)
+	}
+	oldDACL, _, err := sd.DACL()
+	if err != nil {
+		t.Fatalf("DACL %s: %v", path, err)
+	}
+	newDACL, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{{
+		AccessPermissions: mask,
+		AccessMode:        windows.DENY_ACCESS,
+		Inheritance:       windows.NO_INHERITANCE,
+		Trustee: windows.TRUSTEE{
+			TrusteeForm:  windows.TRUSTEE_IS_SID,
+			TrusteeType:  windows.TRUSTEE_IS_WELL_KNOWN_GROUP,
+			TrusteeValue: windows.TrusteeValueFromSID(sid),
+		},
+	}}, oldDACL)
+	if err != nil {
+		t.Fatalf("ACLFromEntries %s: %v", path, err)
+	}
+	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION, nil, nil, newDACL, nil); err != nil {
+		t.Fatalf("SetNamedSecurityInfo %s: %v", path, err)
+	}
+}
+
+// TestWindowsPathDeniesCapabilitySIDRejectsPartialWriteDeny is the regression
+// for jatmn's complete-coverage finding: a stable-SID deny that only blocks
+// FILE_WRITE_ATTRIBUTES (or any other proper subset of the write probe mask)
+// must not be accepted as descendant coverage. FILE_WRITE_DATA would still
+// pass through a Users/AuthUsers allow under a partial-deny check that only
+// tested non-zero overlap with the probe mask.
+func TestWindowsPathDeniesCapabilitySIDRejectsPartialWriteDeny(t *testing.T) {
+	const sidStr = "S-1-1-0"
+	dir := t.TempDir()
+	denyCapabilityMask(t, dir, sidStr, windows.FILE_WRITE_ATTRIBUTES)
+
+	denied, err := windowsPathDeniesCapabilitySID(dir, sidStr)
+	if err != nil {
+		t.Fatalf("windowsPathDeniesCapabilitySID: %v", err)
+	}
+	if denied {
+		t.Fatal("windowsPathDeniesCapabilitySID = true for FILE_WRITE_ATTRIBUTES-only deny, want false: partial deny must not certify write coverage")
+	}
+
+	// applyWindowsSharedDescendantDenies must still apply the full canonical
+	// deny when the only pre-existing ACE is this partial one.
+	scanRoot := t.TempDir()
+	child := mkdir(t, filepath.Join(scanRoot, "partial"))
+	grantUsersWrite(t, child)
+	denyCapabilityMask(t, child, sidStr, windows.FILE_WRITE_ATTRIBUTES)
+	if denied, err := windowsPathDeniesCapabilitySID(child, sidStr); err != nil || denied {
+		t.Fatalf("precondition: partial deny on child must not count as coverage (denied=%v err=%v)", denied, err)
+	}
+	if _, err := applyWindowsSharedDescendantDenies(scanRoot, sidStr, nil); err != nil {
+		t.Fatalf("applyWindowsSharedDescendantDenies: %v", err)
+	}
+	if denied, err := windowsPathDeniesCapabilitySID(child, sidStr); err != nil || !denied {
+		t.Fatalf("after apply: want full write deny on partial-deny child (denied=%v err=%v)", denied, err)
+	}
+}
+
+// TestWindowsEnumerateWritableDescendantsSkipsJunctions is the real-Windows
+// regression for jatmn's compatibility-junction finding: a directory junction
+// under the scan root must not be followed (re-walking the target tree) or
+// hard-failed when the reparse is non-listable. The real target path is still
+// examined when reached without going through the reparse.
+func TestWindowsEnumerateWritableDescendantsSkipsJunctions(t *testing.T) {
+	root := t.TempDir()
+	realDir := mkdir(t, filepath.Join(root, "real"))
+	writable := mkdir(t, filepath.Join(realDir, "writable"))
+	grantUsersWrite(t, writable)
+	junc := filepath.Join(root, "junc")
+	// mklink /J needs no elevation; create the junction via cmd.
+	out, err := exec.Command("cmd", "/c", "mklink", "/J", junc, realDir).CombinedOutput()
+	if err != nil {
+		t.Skipf("cannot create junction (mklink /J): %v %s", err, strings.TrimSpace(string(out)))
+	}
+	t.Cleanup(func() { _ = os.Remove(junc) })
+
+	if !windowsPathIsReparsePoint(junc) {
+		t.Fatalf("fixture bug: %q is not a reparse point", junc)
+	}
+
+	found, err := windowsEnumerateWritableDescendants(root, nil)
+	if err != nil {
+		t.Fatalf("windowsEnumerateWritableDescendants: %v", err)
+	}
+	if !windowsPathListContains(found, writable) {
+		t.Fatalf("enumeration = %#v, want writable child %q via real path", found, writable)
+	}
+	// Junction path itself must not appear: no-follow skips reparse entries
+	// entirely (DACL inspect would follow and risk double-counting).
+	juncWritable := filepath.Join(junc, "writable")
+	if windowsPathListContains(found, junc) || windowsPathListContains(found, juncWritable) {
+		t.Fatalf("enumeration = %#v, must not include junction path %q or its followed child", found, junc)
+	}
+}
+
 func TestWindowsEnsureSharedDescendantCoverageDeduplicatesRootDeny(t *testing.T) {
 	dir := t.TempDir()
 	sid := "S-1-1-0"
@@ -608,5 +718,12 @@ func TestWindowsEnsureSharedDescendantCoverageDeduplicatesRootDeny(t *testing.T)
 	denied, err := windowsPathDeniesCapabilitySID(dir, sid)
 	if err != nil || !denied {
 		t.Fatalf("expected root to be denied before re-check, denied=%v, err=%v", denied, err)
+	}
+	// Second check must still report complete coverage so command-time
+	// windowsEnsureSharedDescendantCoverage skips SetEntriesInAclW rather
+	// than stacking another permanent DENY_ACCESS ACE on the root.
+	deniedAgain, err := windowsPathDeniesCapabilitySID(dir, sid)
+	if err != nil || !deniedAgain {
+		t.Fatalf("expected idempotent complete deny on re-check, denied=%v, err=%v", deniedAgain, err)
 	}
 }

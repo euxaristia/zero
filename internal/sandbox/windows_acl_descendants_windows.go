@@ -34,18 +34,24 @@ import (
 //     These bounds must be large enough that a stock C:\ (with its Windows,
 //     Program Files, and WinSxS trees) actually completes — see the comment on
 //     the vars below for the reasoning and the honest limits of that estimate.
-//   - Reparse points (junctions, symlinks, volume mount points) are NOT a
-//     special case: CreateFile/GetNamedSecurityInfo/ReadDir called on a path
-//     without FILE_FLAG_OPEN_REPARSE_POINT already transparently resolve
-//     through a directory junction or symlink to its target (standard NTFS
-//     reparse behavior), so treating a reparse point exactly like a normal
-//     directory here already inspects and descends into whatever it actually
-//     points at. A stock drive has real compatibility junctions (e.g.
-//     C:\Documents and Settings -> C:\Users) that must not hard-fail the scan
-//     (see jatmn's review); this walker no longer special-cases them at all.
-//     What bounds a pathological loop (a junction pointing at an ancestor) is
-//     the same depth/entry cap as everything else — worst case that fails
-//     closed, it does not run forever.
+//   - Reparse points (junctions, symlinks, volume mount points) use a
+//     no-follow, identity-aware policy (see jatmn's review). Path APIs without
+//     FILE_FLAG_OPEN_REPARSE_POINT transparently resolve through a directory
+//     junction or symlink, so treating a reparse as an ordinary directory
+//     would either hard-fail on deliberately non-listable compatibility
+//     junctions (C:\Documents and Settings, ProgramData\Application Data, …)
+//     or re-walk an already-scanned tree through the target and blow the
+//     depth/entry cap. The walker therefore:
+//     1. Detects reparse points via FILE_ATTRIBUTE_REPARSE_POINT (and the
+//     ModeSymlink/ModeIrregular bits ReadDir already reports) and never
+//     inspects their DACL, never applies a deny, and never descends.
+//     2. Records the (volume serial, file index) identity of every real
+//     directory it does enter, so an alternate path to the same object
+//     (short name, case variant, or any residual reparse resolution) is
+//     skipped rather than re-enumerated.
+//     Stock compatibility junctions always have a real path sibling that the
+//     walk reaches separately (Documents and Settings -> Users); skipping the
+//     reparse does not leave that tree unexamined.
 //   - A directory this process cannot list, or a child whose DACL it cannot
 //     read, is fail-closed UNLESS the basename is a known SYSTEM-exclusive
 //     Windows directory (e.g. "System Volume Information") AND it sits at the
@@ -111,10 +117,11 @@ const windowsBroadenedWriteProbeMask windows.ACCESS_MASK = (windows.FILE_GENERIC
 // to each. It returns every snapshot it applied (including on error) so the
 // caller can roll the whole apply back. A descendant it identified as writable
 // but could not deny is a hole it cannot close, so that failure is returned
-// (fail closed). An incomplete enumeration (caps, reparse, unreadable child)
-// is also returned as an error. Descendants that already carry an equivalent
-// deny for denySID are left untouched so setup reruns and command-time
-// revalidation do not accumulate duplicate permanent ACEs.
+// (fail closed). An incomplete enumeration (caps, unreadable non-reparse child)
+// is also returned as an error. Reparse points are skipped by the enumerator
+// (no-follow). Descendants that already carry a complete write deny for
+// denySID are left untouched so setup reruns and command-time revalidation do
+// not accumulate duplicate permanent ACEs.
 func applyWindowsSharedDescendantDenies(root, denySID string, writeRoots []string) ([]windowsACLSnapshot, error) {
 	descendants, err := windowsEnumerateWritableDescendants(root, writeRoots)
 	if err != nil {
@@ -156,9 +163,11 @@ func applyWindowsSharedDescendantDenies(root, denySID string, writeRoots []strin
 // much an escape surface as a writable directory — but only directories are
 // descended into.
 //
-// Fail closed: exhausting the depth or entry caps, encountering a reparse
-// point, or failing to list/inspect a non-allowlisted entry returns an error
-// rather than a partial success the caller could mistake for complete coverage.
+// Fail closed: exhausting the depth or entry caps, or failing to list/inspect
+// a non-allowlisted, non-reparse entry returns an error rather than a partial
+// success the caller could mistake for complete coverage. Reparse points are
+// skipped (no-follow), not treated as incomplete coverage: their targets are
+// reached through the real path when it lies under the same root.
 func windowsEnumerateWritableDescendants(root string, writeRoots []string) ([]string, error) {
 	if windowsCapabilityPathKey(root) == "" {
 		return nil, nil
@@ -184,10 +193,25 @@ func windowsEnumerateWritableDescendants(root string, writeRoots []string) ([]st
 	}
 	var out []string
 	visited := 0
+	// seenIDs records real directory object identities already entered so an
+	// alternate path to the same object is not re-enumerated (identity-aware
+	// half of the reparse policy).
+	seenIDs := make(map[windowsFileObjectID]struct{})
 	queue := []node{{path: root, depth: 0}}
 	for len(queue) > 0 {
 		current := queue[0]
 		queue = queue[1:]
+		// Defensive: never list through a reparse path that somehow reached
+		// the queue (root is expected to be a real directory).
+		if windowsPathIsReparsePoint(current.path) {
+			continue
+		}
+		if id, ok := windowsFileObjectIdentity(current.path); ok {
+			if _, seen := seenIDs[id]; seen {
+				continue
+			}
+			seenIDs[id] = struct{}{}
+		}
 		entries, err := os.ReadDir(current.path)
 		if err != nil {
 			if windowsPathIsDriveRootPath(filepath.Dir(current.path)) && windowsDescendantScanNameIsSystemLocked(filepath.Base(current.path)) {
@@ -201,7 +225,18 @@ func windowsEnumerateWritableDescendants(root string, writeRoots []string) ([]st
 			if isExcluded(childKey) {
 				continue
 			}
-			isReparse := (entry.Type()&os.ModeSymlink != 0) || (entry.Type()&os.ModeIrregular != 0)
+			// No-follow: stock compatibility junctions (and any other reparse
+			// point) are never DACL-inspected, denied, or descended. Mode bits
+			// catch what ReadDir already classified; GetFileAttributes covers
+			// any reparse form those bits miss.
+			isReparse := (entry.Type()&os.ModeSymlink != 0) || (entry.Type()&os.ModeIrregular != 0) || windowsPathIsReparsePoint(child)
+			if isReparse {
+				if visited >= windowsDescendantScanMaxDirs {
+					return nil, fmt.Errorf("descendant scan exceeded %d entries below %s", windowsDescendantScanMaxDirs, root)
+				}
+				visited++
+				continue
+			}
 			if visited >= windowsDescendantScanMaxDirs {
 				return nil, fmt.Errorf("descendant scan exceeded %d entries below %s", windowsDescendantScanMaxDirs, root)
 			}
@@ -219,7 +254,7 @@ func windowsEnumerateWritableDescendants(root string, writeRoots []string) ([]st
 			if writable {
 				out = append(out, child)
 			}
-			if isReparse || !entry.IsDir() {
+			if !entry.IsDir() {
 				continue
 			}
 			childDepth := current.depth + 1
@@ -247,6 +282,51 @@ func windowsEnumerateWritableDescendants(root string, writeRoots []string) ([]st
 		}
 	}
 	return out, nil
+}
+
+// windowsFileObjectID is the NTFS object identity used to detect that two
+// paths name the same directory (volume serial + 64-bit file index).
+type windowsFileObjectID struct {
+	volume uint32
+	index  uint64
+}
+
+// windowsFileObjectIdentity returns the on-disk identity of path when it can
+// be opened as a real (non-reparse) directory. ok is false on any open/inspect
+// failure so the walker falls through to path-based enumeration rather than
+// treating an unreadable directory as already-seen.
+func windowsFileObjectIdentity(path string) (windowsFileObjectID, bool) {
+	ptr, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return windowsFileObjectID{}, false
+	}
+	handle, err := windows.CreateFile(
+		ptr,
+		windows.FILE_READ_ATTRIBUTES,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		0,
+	)
+	if err != nil {
+		return windowsFileObjectID{}, false
+	}
+	defer windows.CloseHandle(handle)
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(handle, &info); err != nil {
+		return windowsFileObjectID{}, false
+	}
+	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return windowsFileObjectID{}, false
+	}
+	if info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
+		return windowsFileObjectID{}, false
+	}
+	return windowsFileObjectID{
+		volume: info.VolumeSerialNumber,
+		index:  (uint64(info.FileIndexHigh) << 32) | uint64(info.FileIndexLow),
+	}, true
 }
 
 // windowsAccessAllowedObjectAceType and windowsAccessDeniedObjectAceType are
@@ -488,15 +568,17 @@ func windowsUncoveredWritableDescendants(root, denySID string, writeRoots []stri
 }
 
 // windowsPathDeniesCapabilitySID reports whether path's DACL already contains
-// a deny ACE naming the given capability SID string (the synthetic identity
-// used for shared-root / descendant DenyWrite entries) that covers write
-// access. A deny ACE for the right SID is only "already denies write" if its
-// mask actually includes write-relevant bits: the same stable capability SID
-// is also used for DenyRead entries (planWindowsDenyReadPaths), so a path
-// that only carries a pre-existing DenyRead ACE for wantSID must NOT be
-// mistaken for one that already blocks writes — see jatmn's review, which
-// found this would mask a real writable descendant under a DenyRead path and
-// skip closing it.
+// deny ACE(s) naming the given capability SID string (the synthetic identity
+// used for shared-root / descendant DenyWrite entries) that together cover
+// every write-relevant bit in windowsBroadenedWriteProbeMask.
+//
+// A partial deny is not coverage: denying only FILE_WRITE_ATTRIBUTES (or only
+// read/execute via a DenyRead ACE that reuses the same stable SID) leaves
+// FILE_WRITE_DATA / FILE_APPEND_DATA open for a Users/AuthUsers grant, so the
+// apply and verification paths must still merge the full canonical DenyWrite
+// rather than skipping the path — see jatmn's review. Accumulated deny ACEs
+// for wantSID are OR'd before the completeness check so a multi-ACE full
+// cover still counts.
 func windowsPathDeniesCapabilitySID(path, wantSID string) (bool, error) {
 	want, err := windows.StringToSid(wantSID)
 	if err != nil {
