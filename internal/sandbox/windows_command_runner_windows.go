@@ -8,17 +8,18 @@ import (
 )
 
 func runWindowsSandboxCommand(config WindowsSandboxCommandConfig, stderr io.Writer) int {
+	// Fully restricted DenyRead tokens cannot load ordinary Users-granted
+	// system binaries without SID broadening; broadening is permanently off
+	// because it admits write grants outside WriteRoots. Reject on both the
+	// elevated and unelevated restricted-token tiers before setup or launch
+	// until access-time confinement exists (PR #640).
+	if err := windowsDenyReadRestrictedTokenUnsupported(config); err != nil {
+		fmt.Fprintln(stderr, WindowsSandboxCommandRunnerName+": "+err.Error())
+		return 1
+	}
 	switch config.SandboxLevel {
 	case WindowsSandboxLevelRestrictedToken:
 		if err := ValidateWindowsSandboxSetupMarker(WindowsSandboxSetupConfigFromCommand(config)); err != nil {
-			fmt.Fprintln(stderr, WindowsSandboxCommandRunnerName+": "+err.Error())
-			return 1
-		}
-		// Fully restricted DenyRead tokens cannot load ordinary Users-granted
-		// system binaries without SID broadening; broadening is permanently
-		// off because it admits write grants outside WriteRoots. Reject before
-		// launch until access-time confinement exists (PR #640).
-		if err := windowsDenyReadRestrictedTokenUnsupported(config); err != nil {
 			fmt.Fprintln(stderr, WindowsSandboxCommandRunnerName+": "+err.Error())
 			return 1
 		}
@@ -79,9 +80,9 @@ func runWindowsSandboxCommand(config WindowsSandboxCommandConfig, stderr io.Writ
 	tokenSIDs := windowsRuntimeTokenSIDs(capabilitySIDs, offlineSID, config.PermissionProfile.Network.Mode)
 	// WRITE_RESTRICTED keeps reads unrestricted so sandboxed commands can load
 	// Users-granted executables. It is only used when DenyRead is empty (#612:
-	// WRITE_RESTRICTED skips restricted-SID deny ACEs for reads). DenyRead on
-	// the restricted-token tier is rejected above rather than launching a fully
-	// restricted narrow-SID token that cannot execute normal tools.
+	// WRITE_RESTRICTED skips restricted-SID deny ACEs for reads). Non-empty
+	// DenyRead is rejected above for both runner levels rather than launching a
+	// fully restricted narrow-SID token that cannot execute normal tools.
 	writeRestricted := len(config.PermissionProfile.FileSystem.DenyRead) == 0
 	// Users/Authenticated Users SID broadening is permanently disabled: those
 	// groups unlock write grants outside WriteRoots, and preflight DenyWrite

@@ -211,10 +211,18 @@ func TestWindowsUnelevatedRealSandboxSmoke(t *testing.T) {
 		t.Fatalf("expected the unelevated setup marker to be recorded: %v", err)
 	}
 
-	// DenyRead check: reading from the privateDir must be blocked (exit code 1)
-	runWindowsRealSmokeCommand(t, runnerExe, config, []string{
+	// DenyRead is unsupported on both restricted-token tiers under the narrow
+	// SID set (PR #640): the runner must reject before launch rather than
+	// attempting a fully restricted token that cannot load system tools.
+	denyReadConfig := config
+	denyReadConfig.PermissionProfile.FileSystem.DenyRead = []string{privateDir}
+	runWindowsRealSmokeCommandExpectError(t, runnerExe, denyReadConfig, []string{
 		"cmd.exe", "/d", "/s", "/c", "type " + secretFile,
-	}, 1)
+	}, "DenyRead", "not supported")
+	// The secret must remain readable from the host; the sandbox never ran.
+	if data, err := os.ReadFile(secretFile); err != nil || string(data) != "super-secret" {
+		t.Fatalf("host secret file after rejected DenyRead launch: %q, %v", data, err)
+	}
 
 	outsideMarker := filepath.Join(outside, "unelevated-write-denied.txt")
 	runWindowsRealSmokeCommand(t, runnerExe, config, []string{
@@ -423,6 +431,31 @@ func runWindowsRealSmokeCommand(t *testing.T, runnerExe string, base WindowsSand
 	}
 	if wantCode != 0 {
 		t.Fatalf("Windows sandbox command exit code = 0, want %d\n%s", wantCode, output)
+	}
+}
+
+// runWindowsRealSmokeCommandExpectError runs the command runner and requires a
+// non-zero exit whose combined output contains each want substring (used for
+// explicit unsupported-mode rejections rather than sandboxed command failures).
+func runWindowsRealSmokeCommandExpectError(t *testing.T, runnerExe string, base WindowsSandboxCommandArgsOptions, command []string, wantSubstr ...string) {
+	t.Helper()
+	base.Command = command
+	args, err := BuildWindowsSandboxCommandArgs(base)
+	if err != nil {
+		t.Fatalf("BuildWindowsSandboxCommandArgs: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, runnerExe, args...)
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("Windows sandbox command exit code = 0, want error containing %v\n%s", wantSubstr, output)
+	}
+	text := string(output)
+	for _, want := range wantSubstr {
+		if !strings.Contains(text, want) {
+			t.Fatalf("Windows sandbox command error missing %q: %v\n%s", want, err, output)
+		}
 	}
 }
 

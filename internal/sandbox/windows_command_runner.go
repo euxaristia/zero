@@ -19,25 +19,38 @@ func RunWindowsSandboxCommandRunner(args []string, stderr io.Writer) int {
 	return runWindowsSandboxCommand(config, stderr)
 }
 
-// windowsDenyReadRestrictedTokenUnsupported reports that elevated restricted-
-// token sandboxing cannot run profiles with DenyRead until access-time
-// confinement exists. A fully restricted token without Users/AuthUsers cannot
-// load ordinary system executables; adding those groups reopens write grants
-// outside WriteRoots. Prefer a clear rejection over a silent launch failure.
+// windowsDenyReadRestrictedTokenUnsupported reports that Windows restricted-
+// token sandboxing (elevated restricted-token or unelevated) cannot run
+// profiles with DenyRead until access-time confinement exists. Both runner
+// levels build the same fully restricted narrow-SID token when DenyRead is
+// set: without Users/AuthUsers it cannot load ordinary system executables;
+// adding those groups reopens write grants outside WriteRoots. Prefer a clear
+// rejection over a silent launch failure. Do not recommend the other tier as a
+// workaround: the limitation is the token mechanism, not elevation.
 func windowsDenyReadRestrictedTokenUnsupported(config WindowsSandboxCommandConfig) error {
-	if config.SandboxLevel != WindowsSandboxLevelRestrictedToken {
+	switch config.SandboxLevel {
+	case WindowsSandboxLevelRestrictedToken, WindowsSandboxLevelUnelevated:
+	default:
 		return nil
 	}
-	if len(config.PermissionProfile.FileSystem.DenyRead) == 0 {
+	return windowsDenyReadRestrictedTokenUnsupportedProfile(config.PermissionProfile)
+}
+
+// windowsDenyReadRestrictedTokenUnsupportedProfile is the level-agnostic check
+// used by the manager, command-plan builder, setup, and runner so DenyRead is
+// rejected before any restricted-token path can provision or launch.
+func windowsDenyReadRestrictedTokenUnsupportedProfile(profile PermissionProfile) error {
+	if len(profile.FileSystem.DenyRead) == 0 {
 		return nil
 	}
 	return fmt.Errorf(
-		"DenyRead is not supported with the elevated Windows restricted-token sandbox: "+
-			"without Users/Authenticated Users in the restricting SID set, ordinary system "+
-			"binaries under Program Files and Windows cannot load, and adding those groups "+
-			"would admit their existing write grants outside WriteRoots. "+
-			"Use `--sandbox forbid`, the unelevated sandbox tier, omit DenyRead, or wait for "+
-			"access-time confinement (AppContainer/LPAC-style). Configured DenyRead paths: %s",
-		strings.Join(config.PermissionProfile.FileSystem.DenyRead, ", "),
+		"DenyRead is not supported with the Windows restricted-token sandbox "+
+			"(elevated or unelevated): without Users/Authenticated Users in the "+
+			"restricting SID set, ordinary system binaries under Program Files and "+
+			"Windows cannot load, and adding those groups would admit their existing "+
+			"write grants outside WriteRoots. "+
+			"Use `--sandbox forbid`, omit DenyRead, or wait for access-time confinement "+
+			"(AppContainer/LPAC-style). Configured DenyRead paths: %s",
+		strings.Join(profile.FileSystem.DenyRead, ", "),
 	)
 }

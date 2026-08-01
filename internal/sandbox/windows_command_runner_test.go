@@ -6,46 +6,47 @@ import (
 )
 
 func TestWindowsDenyReadRestrictedTokenUnsupported(t *testing.T) {
-	// Restricted-token + DenyRead must be rejected before launch.
-	err := windowsDenyReadRestrictedTokenUnsupported(WindowsSandboxCommandConfig{
-		SandboxLevel: WindowsSandboxLevelRestrictedToken,
-		PermissionProfile: PermissionProfile{
-			FileSystem: FileSystemPolicy{
-				Kind:     FileSystemRestricted,
-				DenyRead: []string{`C:\secret`, `D:\private`},
+	// Both restricted-token runner levels reject DenyRead before launch/setup.
+	for _, level := range []WindowsSandboxLevel{
+		WindowsSandboxLevelRestrictedToken,
+		WindowsSandboxLevelUnelevated,
+	} {
+		err := windowsDenyReadRestrictedTokenUnsupported(WindowsSandboxCommandConfig{
+			SandboxLevel: level,
+			PermissionProfile: PermissionProfile{
+				FileSystem: FileSystemPolicy{
+					Kind:     FileSystemRestricted,
+					DenyRead: []string{`C:\secret`, `D:\private`},
+				},
 			},
-		},
-	})
-	if err == nil {
-		t.Fatal("expected unsupported error for restricted-token DenyRead profile")
-	}
-	msg := err.Error()
-	for _, want := range []string{"DenyRead", "not supported", "restricted-token", `C:\secret`} {
-		if !strings.Contains(msg, want) {
-			t.Fatalf("error %q missing %q", msg, want)
+		})
+		if err == nil {
+			t.Fatalf("expected unsupported error for %s DenyRead profile", level)
+		}
+		msg := err.Error()
+		for _, want := range []string{"DenyRead", "not supported", "restricted-token", "unelevated", `C:\secret`} {
+			if !strings.Contains(msg, want) {
+				t.Fatalf("%s error %q missing %q", level, msg, want)
+			}
+		}
+		// Must not point users at the other restricted-token tier as a workaround.
+		if strings.Contains(msg, "Use `--sandbox forbid`, the unelevated") {
+			t.Fatalf("%s error still recommends unelevated as a DenyRead workaround: %q", level, msg)
 		}
 	}
 
 	// No DenyRead: allowed (WRITE_RESTRICTED path can launch system tools).
-	if err := windowsDenyReadRestrictedTokenUnsupported(WindowsSandboxCommandConfig{
-		SandboxLevel: WindowsSandboxLevelRestrictedToken,
-		PermissionProfile: PermissionProfile{
-			FileSystem: FileSystemPolicy{Kind: FileSystemRestricted},
-		},
-	}); err != nil {
-		t.Fatalf("unexpected error without DenyRead: %v", err)
-	}
-
-	// Unelevated + DenyRead remains allowed (different token tier).
-	if err := windowsDenyReadRestrictedTokenUnsupported(WindowsSandboxCommandConfig{
-		SandboxLevel: WindowsSandboxLevelUnelevated,
-		PermissionProfile: PermissionProfile{
-			FileSystem: FileSystemPolicy{
-				Kind:     FileSystemRestricted,
-				DenyRead: []string{`C:\secret`},
+	for _, level := range []WindowsSandboxLevel{
+		WindowsSandboxLevelRestrictedToken,
+		WindowsSandboxLevelUnelevated,
+	} {
+		if err := windowsDenyReadRestrictedTokenUnsupported(WindowsSandboxCommandConfig{
+			SandboxLevel: level,
+			PermissionProfile: PermissionProfile{
+				FileSystem: FileSystemPolicy{Kind: FileSystemRestricted},
 			},
-		},
-	}); err != nil {
-		t.Fatalf("unexpected error for unelevated DenyRead: %v", err)
+		}); err != nil {
+			t.Fatalf("unexpected error without DenyRead at %s: %v", level, err)
+		}
 	}
 }
