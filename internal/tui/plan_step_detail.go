@@ -7,6 +7,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -382,7 +383,7 @@ func (m model) requestPlanStepExplanation(stepIndex int, step planStep) tea.Cmd 
 		}
 		collected := zeroruntime.CollectStream(ctx, events)
 		if collected.Error != "" {
-			return planStepExplanationMsg{stepIndex: stepIndex, key: key, gen: gen, err: fmt.Errorf("%s", collected.Error)}
+			return planStepExplanationMsg{stepIndex: stepIndex, key: key, gen: gen, err: errors.New(collected.Error)}
 		}
 		return planStepExplanationMsg{stepIndex: stepIndex, key: key, gen: gen, text: strings.TrimSpace(collected.Text)}
 	}
