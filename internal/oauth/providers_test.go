@@ -98,6 +98,18 @@ func TestResolveConfigInvalidName(t *testing.T) {
 	}
 }
 
+func TestEnvKey(t *testing.T) {
+	if got := envKey("my-svc", "CLIENT_ID"); got != "ZERO_OAUTH_MY_SVC_CLIENT_ID" {
+		t.Fatalf("envKey = %q", got)
+	}
+	if got := envKey("two.part", "SCOPES"); got != "ZERO_OAUTH_TWO_PART_SCOPES" {
+		t.Fatalf("envKey = %q", got)
+	}
+	if got := envKey("kimi-code", "TOKEN_URL"); got != "ZERO_OAUTH_KIMI_CODE_TOKEN_URL" {
+		t.Fatalf("envKey(kimi-code) = %q", got)
+	}
+}
+
 func TestResolveConfigKimiCodeStripsExtraHeadersOnEndpointOverride(t *testing.T) {
 	isolateKimiDeviceIDStorage(t)
 	r := NewRegistry()

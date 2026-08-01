@@ -1309,7 +1309,12 @@ func (m model) applyProviderWizard() (model, tea.Cmd) {
 		if !preserveExistingCredentialReference {
 			profile = config.SecureProviderProfile(profile, m.userConfigPath)
 		}
-		if _, err := config.UpsertProvider(m.userConfigPath, profile, true); err != nil {
+		// Persist without RuntimeHeaders-derived X-Msh-* keys. Those are
+		// re-attached by applyCatalogDescriptor at resolve time; writing them
+		// would store hostname + device UUID in config.json for no benefit, and
+		// would disagree with `zero auth kimi` (EnsureCatalogProvider).
+		toPersist := stripRuntimeIdentityHeaders(profile)
+		if _, err := config.UpsertProvider(m.userConfigPath, toPersist, true); err != nil {
 			wizard.err = redaction.RedactString(err.Error(), redaction.Options{ExtraSecretValues: []string{secret, profile.APIKey}})
 			return m, nil // nothing committed to live state yet
 		}
@@ -1393,6 +1398,27 @@ func providerWizardRuntimeProfile(profile config.ProviderProfile) config.Provide
 		runtimeProfile.APIKey = strings.TrimSpace(os.Getenv(runtimeProfile.APIKeyEnv))
 	}
 	return runtimeProfile
+}
+
+// stripRuntimeIdentityHeaders returns a copy of profile without X-Msh-* headers
+// so vendor identity is never written to config.json. In-memory / discovery
+// profiles may still carry them; resolve-time applyCatalogDescriptor re-adds
+// the fresh RuntimeHeaders values for canonical Kimi endpoints.
+func stripRuntimeIdentityHeaders(profile config.ProviderProfile) config.ProviderProfile {
+	if len(profile.CustomHeaders) == 0 {
+		return profile
+	}
+	out := profile
+	out.CustomHeaders = maps.Clone(profile.CustomHeaders)
+	for key := range out.CustomHeaders {
+		if strings.HasPrefix(strings.ToLower(key), "x-msh-") {
+			delete(out.CustomHeaders, key)
+		}
+	}
+	if len(out.CustomHeaders) == 0 {
+		out.CustomHeaders = nil
+	}
+	return out
 }
 
 func (m model) providerWizardOverlay(width int) string {

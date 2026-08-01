@@ -652,3 +652,32 @@ func TestProviderWizardProfileAppliesKimiRuntimeHeaders(t *testing.T) {
 		t.Fatal("providerWizardProfile should carry Kimi's device id header")
 	}
 }
+
+// TestStripRuntimeIdentityHeadersDropsXMshOnly ensures persist strips Kimi
+// identity headers while keeping unrelated custom headers (and matching
+// `zero auth kimi`, which never writes X-Msh-* into config.json).
+func TestStripRuntimeIdentityHeadersDropsXMshOnly(t *testing.T) {
+	profile := config.ProviderProfile{
+		Name:      "kimi-code",
+		CatalogID: "kimi-code",
+		CustomHeaders: map[string]string{
+			"X-Msh-Device-Id":   "device-uuid",
+			"X-Msh-Device-Name": "hostname",
+			"X-Msh-Platform":    "kimi_code_cli",
+			"X-User-Agent":      "keep-me",
+		},
+	}
+	got := stripRuntimeIdentityHeaders(profile)
+	for key := range got.CustomHeaders {
+		if strings.HasPrefix(strings.ToLower(key), "x-msh-") {
+			t.Fatalf("persist copy still has identity header: %#v", got.CustomHeaders)
+		}
+	}
+	if got.CustomHeaders["X-User-Agent"] != "keep-me" {
+		t.Fatalf("user header lost: %#v", got.CustomHeaders)
+	}
+	// Original in-memory profile must keep runtime headers for discovery.
+	if profile.CustomHeaders["X-Msh-Device-Id"] != "device-uuid" {
+		t.Fatalf("strip mutated the in-memory profile: %#v", profile.CustomHeaders)
+	}
+}

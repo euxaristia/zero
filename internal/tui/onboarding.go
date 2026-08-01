@@ -111,10 +111,18 @@ type setupOAuthMsg struct {
 // setupOAuthProviderOptions filters the full provider list to the OAuth-capable
 // ones for the OAuth method path. ChatGPT/Claude are not here — they can't do
 // real in-app OAuth (use "browse" + a local proxy); see docs/oauth-subscriptions.md.
+//
+// Uses OAuthProviders() (listing clones) rather than Get(): Get runs
+// RuntimeHeaders and would mint ~/.config/zero/kimi-device-id for every user
+// who merely paints the "How do you want to connect?" screen.
 func setupOAuthProviderOptions(all []SetupProviderOption) []SetupProviderOption {
+	oauthIDs := map[string]struct{}{}
+	for _, descriptor := range providercatalog.OAuthProviders() {
+		oauthIDs[descriptor.ID] = struct{}{}
+	}
 	out := []SetupProviderOption{}
 	for _, option := range all {
-		if descriptor, ok := providercatalog.Get(option.ID); ok && descriptor.OAuth {
+		if _, ok := oauthIDs[option.ID]; ok {
 			out = append(out, option)
 		}
 	}

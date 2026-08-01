@@ -428,6 +428,49 @@ func TestReturnedDescriptorsAreCopies(t *testing.T) {
 	}
 }
 
+func TestListByTransportPreservesCatalogOrder(t *testing.T) {
+	cases := map[Transport][]string{
+		TransportOpenAI:    {"openai"},
+		TransportAnthropic: {"anthropic"},
+		TransportGoogle:    {"google"},
+		TransportBedrock:   {"bedrock"},
+		TransportVertex:    {"vertex"},
+		TransportAnthropicCompat: {
+			"minimax", "minimaxi-cn", "opencode-go-anthropic-compatible", "custom-anthropic-compatible",
+		},
+		TransportOpenAICompat: {
+			"gitlawb-opengateway", "aimlapi", "ollama-cloud", "ollama", "lmstudio", "openrouter",
+			"huggingface", "chatgpt", "kimi-code", "groq", "deepseek", "together", "fireworks", "dashscope",
+			"moonshot", "atlascloud", "longcat", "nvidia-nim", "mistral", "github", "xai", "venice",
+			"xiaomi-mimo", "bankr", "zai", "zai-cn", "kilocode", "opencode", "opencode-go", "atomic-chat",
+			"chatgpt-proxy", "custom-openai-compatible",
+		},
+	}
+
+	for transport, wantIDs := range cases {
+		descriptors := ListByTransport(transport)
+		gotIDs := make([]string, 0, len(descriptors))
+		for _, descriptor := range descriptors {
+			if descriptor.Transport != Transport(NormalizeID(string(transport))) {
+				t.Fatalf("ListByTransport(%q) returned provider %q with transport %q", transport, descriptor.ID, descriptor.Transport)
+			}
+			gotIDs = append(gotIDs, descriptor.ID)
+		}
+		if !reflect.DeepEqual(gotIDs, wantIDs) {
+			t.Fatalf("ListByTransport(%q) IDs = %#v, want %#v", transport, gotIDs, wantIDs)
+		}
+	}
+	if descriptors := ListByTransport("missing"); len(descriptors) != 0 {
+		t.Fatalf("ListByTransport(missing) returned %#v, want empty", descriptors)
+	}
+	if gotIDs := descriptorIDs(ListByTransport(TransportOpenAICompatible)); !reflect.DeepEqual(gotIDs, cases[TransportOpenAICompat]) {
+		t.Fatalf("ListByTransport(openai-compatible alias) IDs = %#v, want %#v", gotIDs, cases[TransportOpenAICompat])
+	}
+	if gotIDs := descriptorIDs(ListByTransport(TransportAnthropicCompatible)); !reflect.DeepEqual(gotIDs, cases[TransportAnthropicCompat]) {
+		t.Fatalf("ListByTransport(anthropic-compatible alias) IDs = %#v, want %#v", gotIDs, cases[TransportAnthropicCompat])
+	}
+}
+
 func TestOAuthProviderClassification(t *testing.T) {
 	isolateKimiDeviceIDStorage(t)
 	oauthIDs := descriptorIDs(OAuthProviders())

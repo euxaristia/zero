@@ -52,6 +52,84 @@ func TestSetupMethodOptionsDropsOAuthWithoutOAuthProviders(t *testing.T) {
 	}
 }
 
+// TestSetupMethodAndOAuthProviderScreensDoNotMintKimiDeviceID pins the
+// invariant that painting the method screen (and advancing onto the OAuth
+// provider list that includes kimi-code) must not create kimi-device-id.
+// setupOAuthProviderOptions used to call providercatalog.Get on every option,
+// which ran RuntimeHeaders and minted the file for users who never pick Kimi.
+func TestSetupMethodAndOAuthProviderScreensDoNotMintKimiDeviceID(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", root)
+	t.Setenv("APPDATA", root)
+	t.Setenv("HOME", root)
+
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		t.Fatalf("UserConfigDir: %v", err)
+	}
+	devicePath := filepath.Join(configDir, "zero", "kimi-device-id")
+
+	// Put non-Kimi OAuth providers first so advancing onto the list does not
+	// Get(kimi-code) via resetSetupModels for the default selection. kimi-code
+	// is still present in the list (the regression is enumerating it).
+	m := newModel(context.Background(), Options{
+		Setup: SetupOptions{
+			Visible: true,
+			Providers: []SetupProviderOption{
+				{ID: "openai", Name: "OpenAI", EnvVar: "OPENAI_API_KEY", RequiresAuth: true},
+				{ID: "openrouter", Name: "OpenRouter", EnvVar: "OPENROUTER_API_KEY", RequiresAuth: true},
+				{ID: "xai", Name: "xAI"},
+				{ID: "kimi-code", Name: "Kimi Code", RequiresAuth: true},
+			},
+		},
+	})
+	m.setup.stage = setupStageMethod
+
+	// Method screen render path calls setupMethodOptions → setupOAuthProviderOptions.
+	_ = m.setupMethodOptions()
+	_ = m.setupMethodLines(80)
+	// The filter alone must not mint (this is the exact regression).
+	_ = setupOAuthProviderOptions(m.setup.allProviders)
+
+	// Advance onto the OAuth provider list (same filter, now assigned to m.setup.providers).
+	oauthIdx := -1
+	for i, option := range m.setupMethodOptions() {
+		if option.oauth {
+			oauthIdx = i
+			break
+		}
+	}
+	if oauthIdx < 0 {
+		t.Fatal("expected an OAuth method option when kimi-code is in the setup list")
+	}
+	m.setup.selectedMethod = oauthIdx
+	next, _ := m.advanceSetup()
+	m = next.(model)
+	if m.setup.stage != setupStageProvider || !m.setup.oauthMode {
+		t.Fatalf("stage=%v oauthMode=%v, want provider+oauth", m.setup.stage, m.setup.oauthMode)
+	}
+	// Paint the provider list too.
+	_ = m.setupProviderLines(80, 24)
+
+	if _, err := os.Stat(devicePath); err == nil {
+		t.Fatalf("method/provider screens minted kimi device id at %s", devicePath)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat kimi device id: %v", err)
+	}
+
+	// Filter still includes kimi-code for users who do want it.
+	found := false
+	for _, option := range m.setup.providers {
+		if option.ID == "kimi-code" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("OAuth provider list missing kimi-code: %#v", m.setup.providers)
+	}
+}
+
 func TestAimlapiCheckoutLinkWrapsWithoutTruncation(t *testing.T) {
 	link := "https://checkout.stripe.com/c/pay/cs_test_abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789#fidkdWxOYHwnPyd1blpxYHZxWjA0"
 	lines := aimlapiLinkLines(link, 32)
