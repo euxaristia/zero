@@ -5,9 +5,19 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-
-	"github.com/Gitlawb/zero/internal/kimiidentity"
 )
+
+// isolateKimiDeviceIDStorage redirects os.UserConfigDir so Get("kimi-code")
+// (which runs RuntimeHeaders → kimiidentity.Headers) never writes
+// kimi-device-id under the real user config root. DeviceID is path-keyed, so
+// setting these env vars is enough (no separate cache reset).
+func isolateKimiDeviceIDStorage(t *testing.T) {
+	t.Helper()
+	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", root)
+	t.Setenv("APPDATA", root)
+	t.Setenv("HOME", root)
+}
 
 var expectedCatalogIDs = []string{
 	"gitlawb-opengateway",
@@ -204,6 +214,23 @@ func TestAtlasCloudDescriptor(t *testing.T) {
 }
 
 func TestCatalogDescriptorsExposeRequiredDefaults(t *testing.T) {
+	knownTransports := map[Transport]bool{
+		TransportOpenAI:              true,
+		TransportAnthropic:           true,
+		TransportGoogle:              true,
+		TransportBedrock:             true,
+		TransportVertex:              true,
+		TransportOpenAICompatible:    true,
+		TransportAnthropicCompatible: true,
+	}
+	knownFormats := map[APIFormat]bool{
+		APIFormatOpenAIResponses:       true,
+		APIFormatOpenAIChatCompletions: true,
+		APIFormatAnthropicMessages:     true,
+		APIFormatGoogleGenerateContent: true,
+		APIFormatBedrockConverse:       true,
+		APIFormatVertexGenerateContent: true,
+	}
 	for _, descriptor := range All() {
 		if descriptor.ID == "" {
 			t.Fatal("provider ID is required")
@@ -214,7 +241,7 @@ func TestCatalogDescriptorsExposeRequiredDefaults(t *testing.T) {
 		if descriptor.Transport == "" {
 			t.Fatalf("provider %q should expose a transport", descriptor.ID)
 		}
-		if !ValidTransport(descriptor.Transport) {
+		if !knownTransports[descriptor.Transport] {
 			t.Fatalf("provider %q has unknown transport %q", descriptor.ID, descriptor.Transport)
 		}
 		if descriptor.DefaultBaseURL == "" {
@@ -227,16 +254,10 @@ func TestCatalogDescriptorsExposeRequiredDefaults(t *testing.T) {
 			t.Fatalf("provider %q should expose at least one supported API format", descriptor.ID)
 		}
 		for _, format := range descriptor.SupportedAPIFormats {
-			if !ValidAPIFormat(format) {
+			if !knownFormats[format] {
 				t.Fatalf("provider %q has unknown API format %q", descriptor.ID, format)
 			}
 		}
-	}
-	if ValidTransport("missing") {
-		t.Fatal("ValidTransport should reject unknown transports")
-	}
-	if ValidAPIFormat("missing") {
-		t.Fatal("ValidAPIFormat should reject unknown API formats")
 	}
 }
 
@@ -364,41 +385,6 @@ func TestLookupNormalizesIDsAndAliases(t *testing.T) {
 	}
 }
 
-func TestListByTransportPreservesCatalogOrder(t *testing.T) {
-	cases := map[Transport][]string{
-		TransportOpenAI:          {"openai"},
-		TransportAnthropic:       {"anthropic"},
-		TransportGoogle:          {"google"},
-		TransportBedrock:         {"bedrock"},
-		TransportVertex:          {"vertex"},
-		TransportAnthropicCompat: {"minimax", "minimaxi-cn", "opencode-go-anthropic-compatible", "custom-anthropic-compatible"},
-		TransportOpenAICompat:    {"gitlawb-opengateway", "aimlapi", "ollama-cloud", "ollama", "lmstudio", "openrouter", "huggingface", "chatgpt", "kimi-code", "groq", "deepseek", "together", "fireworks", "dashscope", "moonshot", "atlascloud", "longcat", "nvidia-nim", "mistral", "github", "xai", "venice", "xiaomi-mimo", "bankr", "zai", "zai-cn", "kilocode", "opencode", "opencode-go", "atomic-chat", "chatgpt-proxy", "custom-openai-compatible"},
-	}
-
-	for transport, wantIDs := range cases {
-		descriptors := ListByTransport(transport)
-		gotIDs := make([]string, 0, len(descriptors))
-		for _, descriptor := range descriptors {
-			if descriptor.Transport != Transport(NormalizeID(string(transport))) {
-				t.Fatalf("ListByTransport(%q) returned provider %q with transport %q", transport, descriptor.ID, descriptor.Transport)
-			}
-			gotIDs = append(gotIDs, descriptor.ID)
-		}
-		if !reflect.DeepEqual(gotIDs, wantIDs) {
-			t.Fatalf("ListByTransport(%q) IDs = %#v, want %#v", transport, gotIDs, wantIDs)
-		}
-	}
-	if descriptors := ListByTransport("missing"); len(descriptors) != 0 {
-		t.Fatalf("ListByTransport(missing) returned %#v, want empty", descriptors)
-	}
-	if gotIDs := descriptorIDs(ListByTransport(TransportOpenAICompatible)); !reflect.DeepEqual(gotIDs, cases[TransportOpenAICompat]) {
-		t.Fatalf("ListByTransport(openai-compatible alias) IDs = %#v, want %#v", gotIDs, cases[TransportOpenAICompat])
-	}
-	if gotIDs := descriptorIDs(ListByTransport(TransportAnthropicCompatible)); !reflect.DeepEqual(gotIDs, cases[TransportAnthropicCompat]) {
-		t.Fatalf("ListByTransport(anthropic-compatible alias) IDs = %#v, want %#v", gotIDs, cases[TransportAnthropicCompat])
-	}
-}
-
 func TestReturnedDescriptorsAreCopies(t *testing.T) {
 	descriptors := All()
 	descriptors[0].ID = "changed"
@@ -430,6 +416,7 @@ func TestReturnedDescriptorsAreCopies(t *testing.T) {
 }
 
 func TestOAuthProviderClassification(t *testing.T) {
+	isolateKimiDeviceIDStorage(t)
 	oauthIDs := descriptorIDs(OAuthProviders())
 	if want := []string{"openrouter", "huggingface", "chatgpt", "kimi-code", "xai"}; !reflect.DeepEqual(oauthIDs, want) {
 		t.Fatalf("OAuthProviders() = %#v, want %#v", oauthIDs, want)
@@ -456,6 +443,7 @@ func TestOAuthProviderClassification(t *testing.T) {
 // OAuth descriptor must use a non-conflicting ID ("kimi-code") so resolving
 // "kimi" continues to land on moonshot (endpoint, default model, MOONSHOT_API_KEY).
 func TestKimiAliasStillResolvesToMoonshot(t *testing.T) {
+	isolateKimiDeviceIDStorage(t)
 	d, ok := Get("kimi")
 	if !ok {
 		t.Fatal(`Get("kimi") returned false`)
@@ -492,11 +480,7 @@ func TestKimiAliasStillResolvesToMoonshot(t *testing.T) {
 // does not populate kimi-code's CustomHeaders (which mints a device-id file),
 // while Get does so resolve-time request building still gets the vendor headers.
 func TestKimiRuntimeHeadersOnlyOnGet(t *testing.T) {
-	tempDir := t.TempDir()
-	kimiidentity.ResetDeviceIDForTest()
-	t.Cleanup(kimiidentity.ResetDeviceIDForTest)
-	t.Setenv("XDG_CONFIG_HOME", tempDir)
-	t.Setenv("APPDATA", tempDir)
+	isolateKimiDeviceIDStorage(t)
 	for _, d := range All() {
 		if d.ID == "kimi-code" && d.CustomHeaders != nil {
 			t.Fatalf("All() must not populate kimi-code CustomHeaders: %#v", d.CustomHeaders)

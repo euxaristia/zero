@@ -51,8 +51,9 @@ func Headers() map[string]string {
 }
 
 var (
-	deviceIDMu     sync.Mutex
-	cachedDeviceID = sync.OnceValue(func() string { return loadOrCreateDeviceIDAt(deviceIDPath()) })
+	deviceIDMu       sync.Mutex
+	cachedDevicePath string
+	cachedDeviceID   string
 )
 
 // DeviceID returns the persistent device identifier sent as X-Msh-Device-Id.
@@ -61,19 +62,21 @@ var (
 // that, the ID is stored under the user config dir (zero/kimi-device-id) and
 // minted once on first use. When the config dir is unavailable the ID is
 // still stable for the life of the process.
+//
+// The cache is keyed by the resolved storage path so tests that redirect
+// os.UserConfigDir (via XDG_CONFIG_HOME / APPDATA / HOME) pick up a fresh
+// identity without a separate test-only reset hook.
 func DeviceID() string {
 	deviceIDMu.Lock()
-	fn := cachedDeviceID
-	deviceIDMu.Unlock()
-	return fn()
-}
-
-// ResetDeviceIDForTest resets the process-global DeviceID cache so unit tests
-// can inspect or isolate device identity creation without state pollution.
-func ResetDeviceIDForTest() {
-	deviceIDMu.Lock()
-	cachedDeviceID = sync.OnceValue(func() string { return loadOrCreateDeviceIDAt(deviceIDPath()) })
-	deviceIDMu.Unlock()
+	defer deviceIDMu.Unlock()
+	path := deviceIDPath()
+	if cachedDeviceID != "" && cachedDevicePath == path {
+		return cachedDeviceID
+	}
+	id := loadOrCreateDeviceIDAt(path)
+	cachedDevicePath = path
+	cachedDeviceID = id
+	return id
 }
 
 // loadOrCreateDeviceIDAt is the real load-or-create logic behind DeviceID,
@@ -203,12 +206,22 @@ func repairAbandonedDeviceID(path, id string) string {
 	// before Rename blindly overwrites it. os.Rename replaces atomically.
 	if err := os.Rename(tmpPath, path); err != nil {
 		if errWrite := os.WriteFile(path, []byte(id+"\n"), 0o600); errWrite == nil {
+			// Re-read after the WriteFile fallback so a concurrent writer
+			// that replaced us still converges on the persisted id.
+			if existingID := readValidDeviceID(path); existingID != "" {
+				return existingID
+			}
 			return id
 		}
 		if existingID := readValidDeviceIDWithRetry(path); existingID != "" {
 			return existingID
 		}
 		return id
+	}
+	// Re-read so a racing repair that replaced the published file still
+	// converges (mirrors createOrAdoptDeviceID after a successful publish).
+	if existingID := readValidDeviceID(path); existingID != "" {
+		return existingID
 	}
 	return id
 }

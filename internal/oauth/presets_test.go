@@ -3,8 +3,6 @@ package oauth
 import (
 	"strings"
 	"testing"
-
-	"github.com/Gitlawb/zero/internal/kimiidentity"
 )
 
 func TestScopesOrPresetReturnsACopy(t *testing.T) {
@@ -189,11 +187,8 @@ func TestResolveConfigHuggingFaceWithEnvClientID(t *testing.T) {
 // package's catalog_test.go), so reusing it here would steal that alias from
 // existing moonshot profiles.
 func TestResolveConfigKimiCodePreset(t *testing.T) {
-	tempDir := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", tempDir)
-	t.Setenv("APPDATA", tempDir)
-	kimiidentity.ResetDeviceIDForTest()
-	t.Cleanup(kimiidentity.ResetDeviceIDForTest)
+	// isolateKimiDeviceIDStorage lives in providers_test.go (same package).
+	isolateKimiDeviceIDStorage(t)
 	r := NewRegistry()
 	cfg, flow, err := r.ResolveConfig("kimi-code", map[string]string{"ZERO_OAUTH_ALLOW_PRESETS": "1"})
 	if err != nil {

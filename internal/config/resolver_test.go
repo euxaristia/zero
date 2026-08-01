@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -1562,24 +1561,21 @@ func TestApplyCatalogDescriptorStripsAimlapiAttributionFromRetargetedProfile(t *
 	}
 }
 
-// setKimiUserConfigRoot redirects os.UserConfigDir() to a throwaway temp dir
-// before the kimi-code descriptor's RuntimeHeaders (kimiidentity.Headers) run,
-// so this test never creates or touches the real kimi-device-id file.
-func setKimiUserConfigRoot(t *testing.T) {
+// isolateKimiDeviceIDStorage redirects os.UserConfigDir() to a throwaway temp
+// dir before the kimi-code descriptor's RuntimeHeaders (kimiidentity.Headers)
+// run, so tests never create or touch the real kimi-device-id file. Sets all
+// three env vars os.UserConfigDir may consult so isolation is portable.
+// DeviceID is path-keyed, so no separate cache reset is required.
+func isolateKimiDeviceIDStorage(t *testing.T) {
 	t.Helper()
 	root := t.TempDir()
-	switch runtime.GOOS {
-	case "windows":
-		t.Setenv("APPDATA", root)
-	case "darwin":
-		t.Setenv("HOME", root)
-	default:
-		t.Setenv("XDG_CONFIG_HOME", root)
-	}
+	t.Setenv("XDG_CONFIG_HOME", root)
+	t.Setenv("APPDATA", root)
+	t.Setenv("HOME", root)
 }
 
 func TestApplyCatalogDescriptorStripsKimiIdentityFromRetargetedProfile(t *testing.T) {
-	setKimiUserConfigRoot(t)
+	isolateKimiDeviceIDStorage(t)
 	descriptor, err := providercatalog.Require("kimi-code")
 	if err != nil {
 		t.Fatal(err)

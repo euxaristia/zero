@@ -260,34 +260,6 @@ func Require(id string) (Descriptor, error) {
 	return descriptor, nil
 }
 
-func ListByTransport(transport Transport) []Descriptor {
-	normalized := Transport(NormalizeID(string(transport)))
-	items := make([]Descriptor, 0)
-	for _, descriptor := range descriptors {
-		if descriptor.Transport == normalized {
-			items = append(items, cloneDescriptor(descriptor, false))
-		}
-	}
-	return items
-}
-
-func ValidTransport(transport Transport) bool {
-	switch Transport(NormalizeID(string(transport))) {
-	case TransportOpenAI, TransportAnthropic, TransportGoogle, TransportBedrock, TransportVertex, TransportOpenAICompatible, TransportAnthropicCompatible:
-		return true
-	default:
-		return false
-	}
-}
-
-func ValidAPIFormat(format APIFormat) bool {
-	switch format {
-	case APIFormatOpenAIResponses, APIFormatOpenAIChatCompletions, APIFormatAnthropicMessages, APIFormatGoogleGenerateContent, APIFormatBedrockConverse, APIFormatVertexGenerateContent:
-		return true
-	default:
-		return false
-	}
-}
 func NormalizeID(id string) string {
 	var builder strings.Builder
 	lastDash := false
@@ -444,11 +416,10 @@ func transportDescriptor(id string, name string, transport Transport, baseURL st
 // cloneDescriptor returns an independent copy of descriptor. When
 // withRuntimeHeaders is true, a descriptor with RuntimeHeaders set (e.g.
 // kimi-code) also receives its vendor identity headers (including a persistent
-// device ID on disk). Listing paths (All, OAuthProviders, ListByTransport)
-// pass false so merely enumerating providers never mints
-// ~/.config/zero/kimi-device-id for users who never touch Kimi; Get/Require
-// pass true so resolve-time profile building and completions still present the
-// same identity the OAuth login used.
+// device ID on disk). Listing paths (All, OAuthProviders) pass false so merely
+// enumerating providers never mints ~/.config/zero/kimi-device-id for users
+// who never touch Kimi; Get/Require pass true so resolve-time profile building
+// and completions still present the same identity the OAuth login used.
 func cloneDescriptor(descriptor Descriptor, withRuntimeHeaders bool) Descriptor {
 	descriptor.AuthEnvVars = append([]string{}, descriptor.AuthEnvVars...)
 	descriptor.SupportedAPIFormats = append([]APIFormat{}, descriptor.SupportedAPIFormats...)

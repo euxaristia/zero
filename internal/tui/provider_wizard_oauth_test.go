@@ -15,6 +15,17 @@ import (
 	"github.com/Gitlawb/zero/internal/providercatalog"
 )
 
+// isolateKimiDeviceIDStorage redirects os.UserConfigDir so providerWizardProfile
+// / providercatalog.Get("kimi-code") never write kimi-device-id under the real
+// user config root. DeviceID is path-keyed, so setting these env vars is enough.
+func isolateKimiDeviceIDStorage(t *testing.T) {
+	t.Helper()
+	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", root)
+	t.Setenv("APPDATA", root)
+	t.Setenv("HOME", root)
+}
+
 // wizardModelAt builds a model whose provider wizard is at step with providerID
 // selected.
 func wizardModelAt(t *testing.T, providerID string, step providerWizardStep) model {
@@ -622,6 +633,7 @@ func TestAppendOAuthLoginProfileAddsOnceAndRespectsRenames(t *testing.T) {
 // through providercatalog.Get (which does run RuntimeHeaders) instead of
 // using the listing descriptor's CustomHeaders directly.
 func TestProviderWizardProfileAppliesKimiRuntimeHeaders(t *testing.T) {
+	isolateKimiDeviceIDStorage(t)
 	m := mouseTestModel()
 	m.providerWizard = m.newProviderWizard()
 	m.providerWizard.selectedMethod = 0

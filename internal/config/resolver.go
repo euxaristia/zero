@@ -1092,12 +1092,18 @@ func applyCatalogDescriptor(profile *ProviderProfile, descriptor providercatalog
 			merged[key] = value
 		}
 		profile.CustomHeaders = merged
-	} else if len(descriptor.CustomHeaders) > 0 && !canonicalCatalogEndpoint {
+	} else if !canonicalCatalogEndpoint && (len(descriptor.CustomHeaders) > 0 || descriptor.RuntimeHeaders != nil) {
 		// Catalog-owned headers (AIMLAPI attribution, Kimi's X-Msh-* device
 		// identity, etc.) are only valid against the catalog endpoint. A profile
 		// can retain those generated headers after its base URL is edited; strip
 		// their names before sending requests to an arbitrary staging/proxy host
 		// while preserving unrelated headers explicitly supplied by the user.
+		//
+		// Gate on RuntimeHeaders as well as CustomHeaders: kimi-code's identity
+		// headers are produced lazily by RuntimeHeaders at Get/Require time. If
+		// that map is empty (or a caller holds a listing descriptor that never
+		// ran RuntimeHeaders), we still must strip any persisted X-Msh-* keys
+		// rather than forwarding them to a retargeted host.
 		for profileKey := range profile.CustomHeaders {
 			for catalogKey := range descriptor.CustomHeaders {
 				if strings.EqualFold(profileKey, catalogKey) {

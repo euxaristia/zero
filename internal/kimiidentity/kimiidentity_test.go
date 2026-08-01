@@ -3,38 +3,14 @@ package kimiidentity
 import (
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
-// setUserConfigRoot redirects os.UserConfigDir() to a throwaway temp dir so a
-// test that calls the process-global Headers()/DeviceID() never creates or
-// touches the real ~/.config/zero (or AppData\zero) kimi-device-id file.
-// Mirrors internal/workspacetrust/trust_test.go: os.UserConfigDir reads
-// APPDATA on Windows, HOME on darwin, and XDG_CONFIG_HOME on Linux, so a
-// single env var isn't portable. Must be called before the first call to
-// Headers()/DeviceID() in the process — DeviceID is a sync.OnceValue, so a
-// call before the redirect is in place would permanently cache the real path.
-func setUserConfigRoot(t *testing.T) {
-	t.Helper()
-	root := t.TempDir()
-	ResetDeviceIDForTest()
-	t.Cleanup(ResetDeviceIDForTest)
-	switch runtime.GOOS {
-	case "windows":
-		t.Setenv("APPDATA", root)
-	case "darwin":
-		t.Setenv("HOME", root)
-	default:
-		t.Setenv("XDG_CONFIG_HOME", root)
-	}
-}
-
 func TestHeadersIncludesDeviceIdentity(t *testing.T) {
-	setUserConfigRoot(t)
+	IsolateDeviceIDStorage(t)
 	headers := Headers()
 	for _, key := range []string{
 		"X-Msh-Platform",

@@ -5,6 +5,17 @@ import (
 	"testing"
 )
 
+// isolateKimiDeviceIDStorage redirects os.UserConfigDir so kimiidentity never
+// writes kimi-device-id under the real user config root. DeviceID is path-keyed,
+// so setting these env vars is enough (no separate cache reset).
+func isolateKimiDeviceIDStorage(t *testing.T) {
+	t.Helper()
+	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", root)
+	t.Setenv("APPDATA", root)
+	t.Setenv("HOME", root)
+}
+
 func TestResolveConfigFromEnv(t *testing.T) {
 	r := NewRegistry()
 	env := map[string]string{
@@ -88,6 +99,7 @@ func TestResolveConfigInvalidName(t *testing.T) {
 }
 
 func TestResolveConfigKimiCodeStripsExtraHeadersOnEndpointOverride(t *testing.T) {
+	isolateKimiDeviceIDStorage(t)
 	r := NewRegistry()
 	// Canonical host (no override): ExtraHeaders has X-Msh-Device-Id
 	cfgCanonical, _, err := r.ResolveConfig("kimi-code", map[string]string{
