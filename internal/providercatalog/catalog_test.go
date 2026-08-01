@@ -2,6 +2,8 @@ package providercatalog
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -17,6 +19,17 @@ func isolateKimiDeviceIDStorage(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", root)
 	t.Setenv("APPDATA", root)
 	t.Setenv("HOME", root)
+}
+
+// kimiDeviceIDFile returns the path kimiidentity would use under the current
+// (possibly test-redirected) os.UserConfigDir.
+func kimiDeviceIDFile(t *testing.T) string {
+	t.Helper()
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		t.Fatalf("UserConfigDir: %v", err)
+	}
+	return filepath.Join(configDir, "zero", "kimi-device-id")
 }
 
 var expectedCatalogIDs = []string{
@@ -491,6 +504,14 @@ func TestKimiRuntimeHeadersOnlyOnGet(t *testing.T) {
 			t.Fatalf("OAuthProviders() must not populate kimi-code CustomHeaders: %#v", d.CustomHeaders)
 		}
 	}
+	// Listing must not mint a device id even if a regression invokes
+	// RuntimeHeaders and discards the returned headers.
+	devicePath := kimiDeviceIDFile(t)
+	if _, err := os.Stat(devicePath); err == nil {
+		t.Fatalf("listing created kimi device id at %s; All/OAuthProviders must not persist identity", devicePath)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat kimi device id after listing: %v", err)
+	}
 	d, ok := Get("kimi-code")
 	if !ok {
 		t.Fatal(`Get("kimi-code") returned false`)
@@ -499,6 +520,9 @@ func TestKimiRuntimeHeadersOnlyOnGet(t *testing.T) {
 		if d.CustomHeaders[header] == "" {
 			t.Fatalf("Get(kimi-code).CustomHeaders[%q] empty, want vendor-identity header for completions", header)
 		}
+	}
+	if _, err := os.Stat(devicePath); err != nil {
+		t.Fatalf("Get(kimi-code) should persist device id at %s: %v", devicePath, err)
 	}
 }
 

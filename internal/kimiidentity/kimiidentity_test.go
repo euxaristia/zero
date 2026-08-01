@@ -32,6 +32,62 @@ func TestHeadersIncludesDeviceIdentity(t *testing.T) {
 	}
 }
 
+// TestDeviceIDReloadsWhenConfigRootChanges pins the path-keyed cache: after an
+// identity is cached for one config root, redirecting os.UserConfigDir must
+// mint (or load) a different root's id rather than returning the first.
+func TestDeviceIDReloadsWhenConfigRootChanges(t *testing.T) {
+	root1 := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", root1)
+	t.Setenv("APPDATA", root1)
+	t.Setenv("HOME", root1)
+	id1 := DeviceID()
+	if !isUUID(id1) {
+		t.Fatalf("DeviceID() under root1 = %q, want UUID", id1)
+	}
+	path1 := mustDeviceIDPath(t)
+	if raw, err := os.ReadFile(path1); err != nil {
+		t.Fatalf("read root1 device id: %v", err)
+	} else if got := strings.TrimSpace(string(raw)); got != id1 {
+		t.Fatalf("root1 file = %q, want %q", got, id1)
+	}
+
+	root2 := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", root2)
+	t.Setenv("APPDATA", root2)
+	t.Setenv("HOME", root2)
+	id2 := DeviceID()
+	if !isUUID(id2) {
+		t.Fatalf("DeviceID() under root2 = %q, want UUID", id2)
+	}
+	if id1 == id2 {
+		t.Fatalf("DeviceID reused first root's id %q after config root change", id1)
+	}
+	path2 := mustDeviceIDPath(t)
+	if path1 == path2 {
+		t.Fatalf("device id path did not change with config root: %q", path1)
+	}
+	if raw, err := os.ReadFile(path2); err != nil {
+		t.Fatalf("read root2 device id: %v", err)
+	} else if got := strings.TrimSpace(string(raw)); got != id2 {
+		t.Fatalf("root2 file = %q, want %q", got, id2)
+	}
+	// First root's file must still hold id1 (no clobber across roots).
+	if raw, err := os.ReadFile(path1); err != nil {
+		t.Fatalf("re-read root1 device id: %v", err)
+	} else if got := strings.TrimSpace(string(raw)); got != id1 {
+		t.Fatalf("root1 file changed after root2 mint: got %q, want %q", got, id1)
+	}
+}
+
+func mustDeviceIDPath(t *testing.T) string {
+	t.Helper()
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		t.Fatalf("UserConfigDir: %v", err)
+	}
+	return filepath.Join(configDir, "zero", "kimi-device-id")
+}
+
 func TestLoadOrCreateDeviceIDExclusiveCreate(t *testing.T) {
 	// Exercise the production loader directly via its path-parameterized
 	// helper. Concurrent first-use must converge on a single persisted ID:
