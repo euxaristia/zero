@@ -130,119 +130,28 @@ func BuildWindowsACLPlan(config WindowsSandboxCommandConfig) (WindowsACLPlan, er
 		}
 	}
 
-	// Deny write to shared Windows-writable directories (C:\, C:\ProgramData,
-	// C:\Windows\Temp, C:\Users\Public) to prevent write-jail escape via the
-	// added Users and Authenticated Users SIDs. Only DenyRead profiles on the
-	// elevated tier (WindowsSandboxLevelRestrictedToken, applied by `zero
-	// sandbox setup` running as Administrator) carry those SIDs at all: a
-	// WRITE_RESTRICTED token reads with its normal identity and is never
-	// broadened, so the default profile needs no shared entries, and only
-	// the elevated tier has the WRITE_DAC needed to edit these system-owned
-	// DACLs. The unelevated tier keeps the narrower restricting-SID set and
-	// never needs these entries either.
-	if config.SandboxLevel == WindowsSandboxLevelRestrictedToken && len(config.PermissionProfile.FileSystem.DenyRead) > 0 {
-		// Resolved from trusted Win32 APIs, not from the
-		// SystemDrive/SystemRoot/ProgramData/PUBLIC environment variables:
-		// see resolveWindowsSharedDenyPaths for why trusting the environment
-		// here would be a spoofable security boundary.
-		systemDrive, systemRoot, programData, publicDir, err := resolveWindowsSharedDenyPaths()
-		if err != nil {
-			return WindowsACLPlan{}, fmt.Errorf("resolve shared deny paths: %w", err)
-		}
-
-		sharedDenyPaths := []string{
-			systemDrive + `\`,
-			programData,
-			systemRoot + `\Temp`,
-			publicDir,
-		}
-
-		// The deny ACEs name only the stable read-only capability SID, which
-		// every broadened token carries (see the runner): a deny ACE blocks
-		// when it matches ANY SID on the token, so one shared identity is
-		// sufficient, and it keeps these machine-wide DACLs at a constant
-		// four entries total. Naming the per-workspace/per-root capability
-		// SIDs here instead would append four permanent deny ACEs for every
-		// distinct project ever sandboxed on the machine, growing C:\,
-		// ProgramData, Windows\Temp, and Public's DACLs without bound.
+	// Shared-path DenyWrite mitigations (C:\, ProgramData, Windows\Temp,
+	// Users\Public) existed only to compensate for Users/Authenticated Users
+	// SID broadening on fully restricted DenyRead tokens. That broadening is
+	// permanently disabled (see runWindowsSandboxCommand): preflight DACL
+	// snapshots cannot enforce a write boundary for the command's lifetime.
+	// Do not stamp new machine-wide DenyWrite ACEs for a feature that never
+	// enables. Still revoke the stable read-only capability SID on configured
+	// write roots when DenyRead is set on the elevated tier, so hosts that
+	// ran earlier PR builds (which did apply shared/descendant denies) do not
+	// keep a stale deny that wins over the write root's Allow.
+	if config.SandboxLevel == WindowsSandboxLevelRestrictedToken && len(config.PermissionProfile.FileSystem.DenyRead) > 0 && len(writeCapabilities) > 0 {
 		caps, err := LoadOrCreateWindowsCapabilitySIDs(config.SandboxHome)
 		if err != nil {
 			return WindowsACLPlan{}, err
 		}
 		denySID := caps.ReadOnly
-
-		for _, denyPath := range sharedDenyPaths {
-			if windowsPathUnderAnyRoot(denyPath, writeCapabilities) {
-				continue // Do not deny write if it IS or is nested under an allowed write root
-			}
-			// NoInherit: these four shared paths must NOT carry an inheritable
-			// ACE. SetNamedSecurityInfo automatically propagates any
-			// inheritable ACE down onto the target's EXISTING descendants
-			// (per Microsoft's documented remarks for SetNamedSecurityInfoW),
-			// not just ones created afterward. C:\ in particular can have an
-			// enormous, slow-to-walk, and largely unrelated existing subtree
-			// (Program Files, Users, arbitrary installed software), and
-			// stamping a synthetic deny ACE onto all of it would also
-			// permanently pollute those machine ACLs and could shadow
-			// legitimate workspace Allow entries for repos that happen to
-			// live under the system drive. Each of these four paths is
-			// listed explicitly (rather than relied on via inheritance from
-			// C:\) precisely so a plain, non-inherited Deny placed directly
-			// on each one is sufficient: it blocks the denied SIDs from
-			// writing (including creating new children) directly under that
-			// path without ever touching any descendant's own ACL.
-			entries = append(entries, WindowsACLEntry{
-				Action:     WindowsACLDenyWrite,
-				Path:       denyPath,
-				Capability: denySID,
-				NoInherit:  true,
-				// A non-inherited deny on this root object blocks new writes
-				// directly under it, but NOT writes to a pre-existing child
-				// that independently grants Users/Authenticated Users write
-				// (the access check for that child never evaluates a
-				// non-inherited parent ACE). applyWindowsACLPlan therefore
-				// enumerates this root's existing writable descendants and
-				// applies a direct, non-inheriting deny to each, a bounded,
-				// targeted scan that never rewrites the ACL of any descendant
-				// that is not itself already writable by those broad groups.
-				ScanDescendants: true,
-			})
-		}
-
-		// Reconcile stale shared/descendant denies: a write-root path here may
-		// previously have been covered by the shared-root/descendant DenyWrite
-		// mitigation above (either directly, if it IS one of the four shared
-		// paths, or as a discovered writable descendant applyWindowsSharedDescendantDenies
-		// denied in an earlier run) before the caller configured it as an
-		// allowed write root. applyWindowsACLPlan only merges the entries in
-		// THIS plan into the existing DACL; it never removes an ACE that is no
-		// longer requested, so that old deny would otherwise survive and win
-		// over the new Allow under Windows' deny-before-allow evaluation. Every
-		// write-root path unconditionally gets a revoke for the stable
-		// read-only capability SID: BuildWindowsACLPlan never intentionally
-		// places a deny for that SID on a write-root path (see the skip above),
-		// so this can never fight an entry this same plan is also adding, and a
-		// revoke against a SID with no matching ACE is a safe no-op.
-		//
-		// RevokeDescendants extends this same reconciliation below the exact
-		// root: promoting C:\Users\shared to a write root when an earlier run
-		// separately denied C:\Users\shared\child (as a discovered writable
-		// descendant of some OTHER shared root, or of a since-reconfigured
-		// write root) must also clear that descendant's stale deny, or it
-		// keeps winning over the root's new inheritable Allow — see jatmn's
-		// review.
 		for _, capability := range writeCapabilities {
 			entries = append(entries, WindowsACLEntry{
-				Action:     WindowsACLRevokeCapability,
-				Path:       capability.Root,
-				Capability: denySID,
-				NoInherit:  true,
-				// A previously-scanned tree can be promoted to a write root by
-				// configuring one of ITS OWN descendants' ancestors — e.g.
-				// C:\Users\shared\child was individually denied by an earlier
-				// run, then the caller configures C:\Users\shared itself as
-				// writable. Revoking only at capability.Root would miss the
-				// stale deny still sitting on child. See RevokeDescendants.
+				Action:            WindowsACLRevokeCapability,
+				Path:              capability.Root,
+				Capability:        denySID,
+				NoInherit:         true,
 				RevokeDescendants: true,
 			})
 		}

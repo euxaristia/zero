@@ -87,20 +87,16 @@ func createWindowsRestrictedTokenForCapabilitySIDs(capabilitySIDStrings []string
 // broadenReadSIDs is set, it also restricts to WinBuiltinUsersSid and
 // WinAuthenticatedUserSid so the sandboxed process can read/execute binaries
 // under paths like C:\Program Files or C:\Windows whose ACLs grant
-// Users/Authenticated Users rather than Everyone. That only matters on the
-// fully restricted token (writeRestricted=false), where reads also require a
-// restricted-SID match; a WRITE_RESTRICTED token reads with its normal
-// identity, so broadening it would gain nothing for reads while letting the
-// groups' write grants pass the restricted-SID write check. Because the
-// restricting-SID check applies to writes as well as reads, broadening also
-// grants write wherever those groups already have it — BuildWindowsACLPlan
-// mitigates that by adding DenyWrite ACEs to the known shared
-// Users/Authenticated-Users-writable directories, but it can only do so
-// with Administrator rights (see WindowsSandboxLevelRestrictedToken).
-// broadenReadSIDs must therefore stay false both when writeRestricted is set
-// and for WindowsSandboxLevelUnelevated, which cannot enforce that
-// mitigation: those keep the original (narrower) SID scope instead of
-// widening the write jail with nothing to close the gap.
+// Users/Authenticated Users rather than Everyone.
+//
+// Callers must pass broadenReadSIDs=false. Preflight DenyWrite compensation
+// cannot enforce a write boundary for the command's lifetime (reparse
+// coverage gaps and post-scan group-writable children), so the runner keeps
+// broadening disabled until access-time confinement (AppContainer/LPAC or
+// equivalent) exists. The parameter remains only so the token builder can
+// refuse the unsafe broadenReadSIDs+writeRestricted combination and so a
+// future access-time design can re-enable a controlled form without another
+// signature change.
 func createWindowsRestrictedTokenFromBase(base windows.Token, capabilitySIDs []windowsLocalSID, writeRestricted, broadenReadSIDs bool) (windows.Token, error) {
 	// Defensive guardrail for the invariant documented above: combining the
 	// two would silently widen the write jail (broadenReadSIDs's write grants)
