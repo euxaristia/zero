@@ -197,8 +197,10 @@ func shellCommand(command string) *exec.Cmd {
 		if strings.HasPrefix(strings.TrimSpace(command), `"`) {
 			command = "call " + command
 		}
+		/* #nosec G204 -- command originates from trusted local configuration; shell invocation is intended for pipe/env support */
 		return exec.Command("cmd", "/C", command)
 	}
+	/* #nosec G204 -- command originates from trusted local configuration; shell invocation is intended for pipe/env support */
 	return exec.Command("sh", "-c", command)
 }
 
