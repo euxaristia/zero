@@ -84,11 +84,7 @@ func runWindowsSandboxCommand(config WindowsSandboxCommandConfig, stderr io.Writ
 	// DenyRead is rejected above for both runner levels rather than launching a
 	// fully restricted narrow-SID token that cannot execute normal tools.
 	writeRestricted := len(config.PermissionProfile.FileSystem.DenyRead) == 0
-	// Users/Authenticated Users SID broadening is permanently disabled: those
-	// groups unlock write grants outside WriteRoots, and preflight DenyWrite
-	// compensation cannot enforce an access-time write boundary. See PR #640.
-	const broadenReadSIDs = false
-	token, err := createWindowsRestrictedTokenForCapabilitySIDs(tokenSIDs, writeRestricted, broadenReadSIDs)
+	token, err := createWindowsRestrictedTokenForCapabilitySIDs(tokenSIDs, writeRestricted)
 	if err != nil {
 		fmt.Fprintln(stderr, WindowsSandboxCommandRunnerName+": "+err.Error())
 		return 1
