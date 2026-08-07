@@ -5520,8 +5520,11 @@ func (m model) runAgentWithOptions(runID int, runCtx context.Context, prompt str
 			if result.Redacted {
 				toolPayload["redacted"] = true
 			}
-			if len(result.Meta) > 0 {
-				toolPayload["meta"] = result.Meta
+			// Strip plan_snapshot from session event meta: WritePlan above (or
+			// the durable plan file) is the plan source of truth; embedding the
+			// full snapshot again would store the plan twice on disk.
+			if meta := sessionToolResultMeta(result.Meta); len(meta) > 0 {
+				toolPayload["meta"] = meta
 			}
 			if len(result.ChangedFiles) > 0 {
 				toolPayload["changedFiles"] = result.ChangedFiles
