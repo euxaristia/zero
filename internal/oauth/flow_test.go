@@ -299,3 +299,67 @@ func TestRefreshPreservesTokenTypeWhenOmitted(t *testing.T) {
 		t.Fatalf("refresh should carry the existing token_type forward, got %q", tok.TokenType)
 	}
 }
+
+// TestExchangeCodeAppliesExtraHeaders pins Config.ExtraHeaders on the
+// authorization-code token exchange request.
+func TestExchangeCodeAppliesExtraHeaders(t *testing.T) {
+	var got http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"at","token_type":"Bearer","expires_in":3600}`))
+	}))
+	defer server.Close()
+	cfg := Config{
+		ClientID:      "c",
+		TokenEndpoint: server.URL,
+		ExtraHeaders:  map[string]string{"X-Msh-Device-Id": "exchange-device-id"},
+	}
+	if _, err := ExchangeCode(context.Background(), server.Client(), cfg, "code", "verifier", "http://127.0.0.1/cb", nil); err != nil {
+		t.Fatalf("ExchangeCode: %v", err)
+	}
+	if got.Get("X-Msh-Device-Id") != "exchange-device-id" {
+		t.Fatalf("X-Msh-Device-Id = %q, want exchange-device-id", got.Get("X-Msh-Device-Id"))
+	}
+}
+
+// TestRefreshAppliesExtraHeaders pins Config.ExtraHeaders on the refresh
+// request path.
+func TestRefreshAppliesExtraHeaders(t *testing.T) {
+	var got http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		_, _ = w.Write([]byte(`{"access_token":"new-at","expires_in":3600}`))
+	}))
+	defer server.Close()
+	cfg := Config{
+		ClientID:      "c",
+		TokenEndpoint: server.URL,
+		ExtraHeaders:  map[string]string{"X-Msh-Device-Id": "refresh-device-id"},
+	}
+	if _, err := Refresh(context.Background(), server.Client(), cfg, Token{RefreshToken: "rt"}, nil); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if got.Get("X-Msh-Device-Id") != "refresh-device-id" {
+		t.Fatalf("X-Msh-Device-Id = %q, want refresh-device-id", got.Get("X-Msh-Device-Id"))
+	}
+}
+
+// TestExchangeCodeWithoutExtraHeadersSendsNone pins that a config without
+// ExtraHeaders does not inject vendor identity headers on exchange.
+func TestExchangeCodeWithoutExtraHeadersSendsNone(t *testing.T) {
+	var got http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"at","token_type":"Bearer","expires_in":3600}`))
+	}))
+	defer server.Close()
+	cfg := Config{ClientID: "c", TokenEndpoint: server.URL}
+	if _, err := ExchangeCode(context.Background(), server.Client(), cfg, "code", "verifier", "http://127.0.0.1/cb", nil); err != nil {
+		t.Fatalf("ExchangeCode: %v", err)
+	}
+	if got.Get("X-Msh-Device-Id") != "" {
+		t.Fatalf("unexpected X-Msh-Device-Id=%q without ExtraHeaders", got.Get("X-Msh-Device-Id"))
+	}
+}

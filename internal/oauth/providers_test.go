@@ -136,3 +136,66 @@ func TestResolveConfigKimiCodeStripsExtraHeadersOnEndpointOverride(t *testing.T)
 		t.Fatalf("expected empty ExtraHeaders on non-canonical host override, got: %v", cfgOverride.ExtraHeaders)
 	}
 }
+
+func TestIsCanonicalKimiHostAllowlist(t *testing.T) {
+	approved := []string{
+		"https://auth.kimi.com/api/oauth/token",
+		"https://AUTH.KIMI.COM/path",
+		"https://api.kimi.com/coding/v1",
+		"https://api.kimi.com/",
+	}
+	for _, ep := range approved {
+		if !isCanonicalKimiHost(ep) {
+			t.Fatalf("isCanonicalKimiHost(%q) = false, want true", ep)
+		}
+	}
+	rejected := []string{
+		"https://evil.kimi.com/oauth",
+		"https://kimi.com/oauth",
+		"https://www.kimi.com/",
+		"https://auth.moonshot.cn/oauth",
+		"https://api.moonshot.cn/v1",
+		"https://attacker.example.com/",
+		"https://auth.kimi.com.evil.example/",
+		"not a url",
+		"",
+	}
+	for _, ep := range rejected {
+		if isCanonicalKimiHost(ep) {
+			t.Fatalf("isCanonicalKimiHost(%q) = true, want false", ep)
+		}
+	}
+}
+
+// Overriding only to another approved Kimi host must keep identity headers.
+func TestResolveConfigKimiCodeKeepsExtraHeadersOnApprovedOverride(t *testing.T) {
+	isolateKimiDeviceIDStorage(t)
+	r := NewRegistry()
+	cfg, _, err := r.ResolveConfig("kimi-code", map[string]string{
+		"ZERO_OAUTH_ALLOW_PRESETS":       "1",
+		"ZERO_OAUTH_KIMI_CODE_TOKEN_URL": "https://api.kimi.com/oauth/token",
+	})
+	if err != nil {
+		t.Fatalf("ResolveConfig: %v", err)
+	}
+	if cfg.ExtraHeaders["X-Msh-Device-Id"] == "" {
+		t.Fatalf("expected ExtraHeaders on approved host override, got: %v", cfg.ExtraHeaders)
+	}
+}
+
+// A kimi.com subdomain that is not on the allowlist must strip identity headers.
+func TestResolveConfigKimiCodeStripsExtraHeadersOnKimiSubdomain(t *testing.T) {
+	isolateKimiDeviceIDStorage(t)
+	r := NewRegistry()
+	cfg, _, err := r.ResolveConfig("kimi-code", map[string]string{
+		"ZERO_OAUTH_ALLOW_PRESETS":        "1",
+		"ZERO_OAUTH_KIMI_CODE_TOKEN_URL":  "https://evil.kimi.com/oauth/token",
+		"ZERO_OAUTH_KIMI_CODE_DEVICE_URL": "https://evil.kimi.com/oauth/device",
+	})
+	if err != nil {
+		t.Fatalf("ResolveConfig: %v", err)
+	}
+	if len(cfg.ExtraHeaders) != 0 {
+		t.Fatalf("expected empty ExtraHeaders on unapproved kimi subdomain, got: %v", cfg.ExtraHeaders)
+	}
+}

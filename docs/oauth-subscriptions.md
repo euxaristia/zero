@@ -57,9 +57,10 @@ Pick **Sign in with OAuth** → the list of providers that do real OAuth → cho
    one-time OAuth-app registration (no secret needed for "public" apps); the
    preset pre-fills scopes, endpoints, and the OIDC issuer. Kimi Code is also
    real OAuth but has no browser flow at all — see the device-code bullet
-   below. The same chooser appears in first-run onboarding. (xAI and Kimi Code
-   use an opt-in preset — set `ZERO_OAUTH_ALLOW_PRESETS=1` or your own
-   `ZERO_OAUTH_XAI_*` / `ZERO_OAUTH_KIMI_CODE_*`; see below.)
+   below. The same chooser appears in first-run onboarding. (`zero auth login`
+   and the interactive wizard enable baked-in presets for xAI / Kimi Code /
+   ChatGPT / Hugging Face without exporting `ZERO_OAUTH_ALLOW_PRESETS`; any
+   field is still overridable with `ZERO_OAUTH_<NAME>_*` — see below.)
 - **Device code (headless / SSH):** for a provider that supports it (xAI, Kimi
    Code, Hugging Face), press **d** on the list to get a code to enter on
    another device instead of opening a browser. On an SSH session or headless
@@ -81,16 +82,17 @@ Pick **Sign in with OAuth** → the list of providers that do real OAuth → cho
   In the interactive setup wizard, pick **OpenRouter** and press **ctrl+o** at the
   key step to do the same inline ("Log in with OAuth"). The minted key is saved to
   the provider profile and used normally.
-- **xAI (Grok) — opt-in preset** — xAI's flow needs an OAuth `client_id`. Zero
-  ships a built-in preset for the public Grok-CLI client, but to keep third-party
-  client identities out of the default credential path it is **off by default**.
-  Enable it with `export ZERO_OAUTH_ALLOW_PRESETS=1`, then `zero auth login xai`
-  (browser, or `--device` for headless) works one-click; the token is used directly
-  on `api.x.ai/v1`. Without the opt-in, set `ZERO_OAUTH_XAI_CLIENT_ID` (and
-  endpoints, or an issuer) yourself via `ZERO_OAUTH_XAI_*`. Either way the preset is
-   fully overridable by `ZERO_OAUTH_XAI_*` (env wins), and it requires a
-   SuperGrok / X Premium+ subscription; the client_id is an undocumented public
-   Grok-CLI client that may change without notice.
+- **xAI (Grok) — built-in preset** — xAI's flow needs an OAuth `client_id`. Zero
+  ships a built-in preset for the public Grok-CLI client. `zero auth login xai`
+  (browser, or `--device` for headless) and the interactive wizard enable that
+  preset automatically (no `ZERO_OAUTH_ALLOW_PRESETS=1` required on those
+  paths); the token is used directly on `api.x.ai/v1`. Library callers that
+  construct an `oauth.Manager` without `AllowPresets: true` still need
+  `ZERO_OAUTH_ALLOW_PRESETS=1`, or can set `ZERO_OAUTH_XAI_CLIENT_ID` (and
+  endpoints, or an issuer) via `ZERO_OAUTH_XAI_*`. Either way the preset is
+  fully overridable by `ZERO_OAUTH_XAI_*` (env wins), and it requires a
+  SuperGrok / X Premium+ subscription; the client_id is an undocumented public
+  Grok-CLI client that may change without notice.
 - **Kimi Code — built-in preset, device-code only** — `zero auth kimi` (or
    `zero auth login kimi-code --device`) runs the RFC 8628 device-code flow
    against `https://auth.kimi.com`. You approve on another device and enter the
@@ -104,9 +106,9 @@ Pick **Sign in with OAuth** → the list of providers that do real OAuth → cho
    API-key-based endpoint, so `zero auth kimi` is CLI sugar that forwards to
    `kimi-code` rather than reusing that name. Like xAI, the preset ships the
    public kimi-cli client identity (`17e5f671-d194-4dfb-9706-5516cb48c098`).
-   Unlike the raw `ZERO_OAUTH_XAI_*`-only path, no `ZERO_OAUTH_ALLOW_PRESETS=1`
-   is needed for Kimi: both `zero auth kimi` and `zero auth login kimi-code`
-   run through the `auth login` engine, which enables presets unconditionally.
+   Both `zero auth kimi` and `zero auth login kimi-code` run through the
+   `auth login` engine, which enables presets unconditionally — no
+   `ZERO_OAUTH_ALLOW_PRESETS=1` is needed (same rule as xAI on those paths).
    Any field is still overridable with
    `ZERO_OAUTH_KIMI_CODE_*`. Kimi's backend also requires a handful of
    vendor-identity `X-Msh-*` headers across all applicable OAuth and API calls

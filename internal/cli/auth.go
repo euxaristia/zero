@@ -606,11 +606,11 @@ Commands:
   kimi                                            Log in to Kimi Code via device code (managed coding endpoint)
 
 A provider is any OAuth 2.0 / OIDC server. "openrouter" ('zero auth openrouter'),
-"chatgpt" ('zero auth chatgpt'), and "kimi" ('zero auth kimi' or
-'zero auth login kimi-code') work out of the box. "xai" ('zero auth login xai')
-uses a built-in preset that is off by default — enable it with
-ZERO_OAUTH_ALLOW_PRESETS=1, or set the ZERO_OAUTH_XAI_* vars yourself.
-Any preset field is overridable via the env vars below. For a custom provider named <name>, set:
+"chatgpt" ('zero auth chatgpt'), "kimi" ('zero auth kimi' or
+'zero auth login kimi-code'), and "xai" ('zero auth login xai') work out of
+the box: "zero auth login" enables baked-in presets for the chosen provider
+without exporting ZERO_OAUTH_ALLOW_PRESETS. Any preset field is overridable
+via the env vars below. For a custom provider named <name>, set:
   ZERO_OAUTH_<NAME>_CLIENT_ID       (required)
   ZERO_OAUTH_<NAME>_CLIENT_SECRET   (optional)
   ZERO_OAUTH_<NAME>_AUTHORIZE_URL   ZERO_OAUTH_<NAME>_TOKEN_URL

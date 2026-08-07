@@ -1,11 +1,11 @@
 // Package kimiidentity builds the X-Msh-* vendor-identity headers Kimi
 // Code's backend requires on every request — OAuth device authorization,
-// token polling, refresh, AND managed-endpoint model calls. It exists as its
-// own dependency-free package because both internal/oauth (login/refresh)
-// and internal/providercatalog (the kimi-code descriptor's CustomHeaders,
-// applied to runtime completions) must send the SAME identity: a login
-// accepted under one device identity and completions sent under another (or
-// under none) is rejected by the backend.
+// token polling, refresh, AND managed-endpoint model calls. It is shared by
+// both internal/oauth (login/refresh) and internal/providercatalog (the
+// kimi-code descriptor's CustomHeaders, applied to runtime completions) so
+// they send the SAME identity: a login accepted under one device identity
+// and completions sent under another (or under none) is rejected by the
+// backend.
 //
 // Header names and general shape are reverse-engineered from the
 // open-source kimi-cli client (src/kimi_cli/auth/oauth.py, _common_headers);
@@ -19,9 +19,12 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Gitlawb/zero/internal/lockutil"
 )
 
 // Headers returns the X-Msh-* vendor-identity headers, including the stable
@@ -84,41 +87,83 @@ func DeviceID() string {
 // directly (env var indirection through os.UserConfigDir is not portable to
 // redirect in tests). It reads an existing UUID if present, otherwise mints
 // one and persists it exclusively (see the concurrency note below).
+//
+// path must be of the form <configRoot>/zero/kimi-device-id. All file
+// operations bind to an opened <configRoot> handle and then the zero/
+// subdirectory so a symlink at zero cannot redirect device-id, lock, or
+// temporary-file traffic outside the configuration root.
 func loadOrCreateDeviceIDAt(path string) string {
-	if path != "" {
-		if id := readValidDeviceID(path); id != "" {
-			return id
-		}
-	}
-	id := generateDeviceID()
 	if path == "" {
+		return generateDeviceID()
+	}
+	root, name, err := openDeviceIDDir(path)
+	if err != nil {
+		return generateDeviceID()
+	}
+	defer root.Close()
+	if id := readValidDeviceID(root, name); id != "" {
 		return id
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return id
-	}
-	// Create exclusively rather than os.WriteFile: two processes racing on
-	// first use must converge on the SAME id, since a login accepted under
-	// one device identity and completions sent under another are rejected
-	// by the backend. The loser reads back the winner's file instead of
-	// overwriting it. After O_EXCL succeeds the winner still has to write
-	// content, so a concurrent loser may briefly observe an empty file;
-	// readValidDeviceIDWithRetry waits for the UUID rather than minting a
-	// second divergent identity. If the winner dies mid-publish leaving an
-	// empty/invalid file, the next caller removes that abandoned file once
-	// and retries exclusive create so the identity is repaired instead of
-	// permanently stuck on a divergent in-memory id.
-	return createOrAdoptDeviceID(path, id)
+	return createOrAdoptDeviceID(root, name, generateDeviceID())
 }
 
-// createOrAdoptDeviceID publishes id at path or adopts a concurrent winner.
-func createOrAdoptDeviceID(path, id string) string {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+// openDeviceIDDir opens the zero/ directory under the configuration root for
+// path (<configRoot>/zero/<name>) using rooted, traversal-resistant handles.
+// A zero component that is a symlink escaping the config root is rejected by
+// Root.OpenRoot rather than followed into attacker-controlled storage.
+func openDeviceIDDir(path string) (*os.Root, string, error) {
+	name := filepath.Base(path)
+	zeroDir := filepath.Dir(path)
+	configDir := filepath.Dir(zeroDir)
+	zeroName := filepath.Base(zeroDir)
+	if name == "" || name == "." || zeroName == "" || zeroName == "." || configDir == "" || configDir == "." {
+		return nil, "", fmt.Errorf("kimiidentity: invalid device-id path %q", path)
+	}
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		return nil, "", err
+	}
+	cfgRoot, err := os.OpenRoot(configDir)
+	if err != nil {
+		return nil, "", err
+	}
+	// Best-effort create; Exist is fine. Root refuses a zero symlink that
+	// points outside configDir on the subsequent OpenRoot.
+	_ = cfgRoot.Mkdir(zeroName, 0o700)
+	zeroRoot, err := cfgRoot.OpenRoot(zeroName)
+	_ = cfgRoot.Close()
+	if err != nil {
+		return nil, "", err
+	}
+	return zeroRoot, name, nil
+}
+
+// createOrAdoptDeviceID publishes id under root/name or adopts a concurrent
+// winner. Content is written completely to a temporary sibling and only then
+// published via exclusive claim + atomic rename, so concurrent readers never
+// observe a partial UUID and a failed write does not report a published id
+// without re-reading whatever actually landed.
+func createOrAdoptDeviceID(root *os.Root, name, id string) string {
+	tmpName := tmpDeviceIDName(name)
+	if err := writeDeviceIDFile(root, tmpName, id); err != nil {
+		// Could not stage a complete publication. Adopt any concurrent winner
+		// rather than claiming id was persisted.
+		if existingID := readValidDeviceIDWithRetry(root, name); existingID != "" {
+			return existingID
+		}
+		return id
+	}
+	defer func() { _ = root.Remove(tmpName) }()
+
+	// Exclusive claim on the destination name. Two processes racing on first
+	// use must converge on the SAME id: the loser adopts the winner's file
+	// instead of overwriting it. The claim creates an empty placeholder that
+	// is immediately replaced by the complete temp via Rename.
+	f, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		if !os.IsExist(err) {
 			return id
 		}
-		if existingID := readValidDeviceIDWithRetry(path); existingID != "" {
+		if existingID := readValidDeviceIDWithRetry(root, name); existingID != "" {
 			return existingID
 		}
 		// path exists but never became a valid UUID (abandoned create,
@@ -126,13 +171,20 @@ func createOrAdoptDeviceID(path, id string) string {
 		// unlocked remove here could unlink another racer's just-published
 		// winner between our failed read and the remove call, handing that
 		// racer back an id that is no longer the one on disk.
-		return repairAbandonedDeviceID(path, id)
+		return repairAbandonedDeviceID(root, name, id)
 	}
-	_, _ = f.WriteString(id + "\n")
-	_ = f.Sync()
 	_ = f.Close()
+	if err := root.Rename(tmpName, name); err != nil {
+		// Publication failed. Prefer whatever is now on disk (another racer
+		// may have repaired/replaced us) over reporting an unpersisted id as
+		// if it were durable.
+		if existingID := readValidDeviceIDWithRetry(root, name); existingID != "" {
+			return existingID
+		}
+		return id
+	}
 	// Re-read so a racing repair that replaced us still converges.
-	if existingID := readValidDeviceID(path); existingID != "" {
+	if existingID := readValidDeviceID(root, name); existingID != "" {
 		return existingID
 	}
 	return id
@@ -141,94 +193,170 @@ func createOrAdoptDeviceID(path, id string) string {
 // repairAbandonedDeviceID fixes an invalid/empty device-id file left behind
 // by a process that exclusive-created path and died before writing a UUID.
 // Repair itself is serialized through an exclusive lock file so only one
-// racing process ever removes and recreates path: without that, one process
-// could unlink another's freshly published replacement and mint a second,
-// divergent id, leaving the first process holding an id that stops matching
-// what is actually persisted. Callers that lose the lock wait for the holder
-// to publish instead of attempting their own repair. If the lock holder dies
-// mid-repair without publishing or unlocking, the lock is broken and retried.
-func repairAbandonedDeviceID(path, id string) string {
-	if existingID := readValidDeviceID(path); existingID != "" {
+// racing process ever replaces path: without that, concurrent writers could
+// mint divergent ids. Callers that lose the lock wait for the holder to
+// publish. A lock is reclaimed only when its recorded holder PID is proven
+// dead (or the lock contents are unparseable/empty, treated as abandoned).
+func repairAbandonedDeviceID(root *os.Root, name, id string) string {
+	if existingID := readValidDeviceID(root, name); existingID != "" {
 		return existingID
 	}
-	lockPath := path + ".lock"
+	lockName := name + ".lock"
 	ownerToken := fmt.Sprintf("%d.%d", os.Getpid(), time.Now().UnixNano())
-	lock, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	lock, err := root.OpenFile(lockName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		if !os.IsExist(err) {
 			return id
 		}
-		if existingID := readValidDeviceIDWithRetry(path); existingID != "" {
+		if existingID := readValidDeviceIDWithRetry(root, name); existingID != "" {
 			return existingID
 		}
-		// If lockPath exists but is stale (owner crashed), break lock and retry once.
-		// Verify lock token and use os.Rename to break the lock atomically so multiple
-		// racers seeing the same stale lock don't blindly unlink a fresh lock.
-		if raw, readErr := os.ReadFile(lockPath); readErr == nil {
-			if info, statErr := os.Stat(lockPath); statErr == nil && time.Since(info.ModTime()) > 2*time.Second {
-				stalePath := fmt.Sprintf("%s.stale.%d.%d", lockPath, os.Getpid(), time.Now().UnixNano())
-				// Re-verify content before renaming to prevent lock stealing
-				if curRaw, _ := os.ReadFile(lockPath); string(curRaw) == string(raw) {
-					if os.Rename(lockPath, stalePath) == nil {
-						_ = os.Remove(stalePath)
-						lock, err = os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-					}
-				}
-			}
+		// Holder crashed or left a corrupt lock: reclaim only when ownership
+		// is proven dead, then retry exclusive create once.
+		if reclaimed, rerr := reclaimDeadRepairLock(root, lockName); rerr == nil && reclaimed {
+			lock, err = root.OpenFile(lockName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		}
 		if err != nil {
-			if existingID := readValidDeviceIDWithRetry(path); existingID != "" {
+			if existingID := readValidDeviceIDWithRetry(root, name); existingID != "" {
 				return existingID
 			}
 			return id
 		}
 	}
-	_, _ = lock.WriteString(ownerToken + "\n")
-	_ = lock.Sync()
+	if _, werr := lock.WriteString(ownerToken + "\n"); werr != nil {
+		_ = lock.Close()
+		_ = root.Remove(lockName)
+		if existingID := readValidDeviceIDWithRetry(root, name); existingID != "" {
+			return existingID
+		}
+		return id
+	}
+	if serr := lock.Sync(); serr != nil {
+		_ = lock.Close()
+		if curRaw, rerr := root.ReadFile(lockName); rerr == nil && strings.TrimSpace(string(curRaw)) == ownerToken {
+			_ = root.Remove(lockName)
+		}
+		if existingID := readValidDeviceIDWithRetry(root, name); existingID != "" {
+			return existingID
+		}
+		return id
+	}
+	// Cleanup is best-effort: DeviceID's API returns only a string, and a
+	// leftover lock after a successful publish is recovered by dead-PID
+	// reclaim (or ignored once a valid device id is readable without the
+	// lock). Only remove the lock when its contents still match our token so
+	// we never delete a concurrent holder's lock.
 	defer func() {
 		_ = lock.Close()
-		if curRaw, _ := os.ReadFile(lockPath); strings.TrimSpace(string(curRaw)) == ownerToken {
-			_ = os.Remove(lockPath)
+		if curRaw, rerr := root.ReadFile(lockName); rerr == nil && strings.TrimSpace(string(curRaw)) == ownerToken {
+			_ = root.Remove(lockName)
 		}
 	}()
 
-	if existingID := readValidDeviceID(path); existingID != "" {
+	if existingID := readValidDeviceID(root, name); existingID != "" {
 		return existingID
 	}
-	tmpPath := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), time.Now().UnixNano())
-	if err := os.WriteFile(tmpPath, []byte(id+"\n"), 0o600); err != nil {
-		return id
-	}
-	defer func() { _ = os.Remove(tmpPath) }()
-
-	// DO NOT os.Remove(path) here. If path is unlinked, a concurrent
-	// createOrAdoptDeviceID can win O_EXCL and write a divergent ID just
-	// before Rename blindly overwrites it. os.Rename replaces atomically.
-	if err := os.Rename(tmpPath, path); err != nil {
-		if errWrite := os.WriteFile(path, []byte(id+"\n"), 0o600); errWrite == nil {
-			// Re-read after the WriteFile fallback so a concurrent writer
-			// that replaced us still converges on the persisted id.
-			if existingID := readValidDeviceID(path); existingID != "" {
-				return existingID
-			}
-			return id
-		}
-		if existingID := readValidDeviceIDWithRetry(path); existingID != "" {
+	tmpName := tmpDeviceIDName(name)
+	if err := writeDeviceIDFile(root, tmpName, id); err != nil {
+		if existingID := readValidDeviceIDWithRetry(root, name); existingID != "" {
 			return existingID
 		}
 		return id
 	}
-	// Re-read so a racing repair that replaced the published file still
-	// converges (mirrors createOrAdoptDeviceID after a successful publish).
-	if existingID := readValidDeviceID(path); existingID != "" {
+	defer func() { _ = root.Remove(tmpName) }()
+
+	// DO NOT Remove(name) here. If name is unlinked, a concurrent
+	// createOrAdoptDeviceID can win O_EXCL and write a divergent ID just
+	// before Rename blindly overwrites it. Rename replaces atomically.
+	// No non-atomic WriteFile fallback: if rename fails, re-read and adopt.
+	if err := root.Rename(tmpName, name); err != nil {
+		if existingID := readValidDeviceIDWithRetry(root, name); existingID != "" {
+			return existingID
+		}
+		return id
+	}
+	if existingID := readValidDeviceID(root, name); existingID != "" {
 		return existingID
 	}
 	return id
 }
 
-// readValidDeviceID returns a UUID from path, or "" if missing/invalid.
-func readValidDeviceID(path string) string {
-	raw, err := os.ReadFile(path)
+// reclaimDeadRepairLock renames the repair lock aside and keeps it only when
+// the holder is proven dead (or the lock is empty/corrupt and therefore not a
+// live lease). Uses lockutil so only one racer wins the rename and a live
+// holder's lock is restored rather than stolen.
+func reclaimDeadRepairLock(root *os.Root, lockName string) (bool, error) {
+	lockPath := filepath.Join(root.Name(), lockName)
+	suffix := fmt.Sprintf("%d.%d", os.Getpid(), time.Now().UnixNano())
+	return lockutil.ReclaimStaleLock(lockPath, suffix, func(reclaimedPath string) bool {
+		raw, err := os.ReadFile(reclaimedPath)
+		if err != nil {
+			// Cannot inspect: fail closed and treat as live so we restore.
+			return true
+		}
+		return lockHolderAlive(raw)
+	})
+}
+
+// lockHolderAlive reports whether the repair-lock contents still represent a
+// live holder. Token format is "<pid>.<nano>". Empty or unparseable contents
+// are treated as dead (abandoned claim) so a crashed mid-write holder can be
+// recovered. A parseable live PID fails closed (not reclaimed).
+func lockHolderAlive(raw []byte) bool {
+	pid, ok := parseLockPID(strings.TrimSpace(string(raw)))
+	if !ok || pid <= 0 {
+		return false
+	}
+	return processAlive(pid)
+}
+
+func parseLockPID(token string) (int, bool) {
+	if token == "" {
+		return 0, false
+	}
+	// ownerToken is "<pid>.<nano>"; take the pid prefix only.
+	dot := strings.IndexByte(token, '.')
+	if dot <= 0 {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(token[:dot])
+	if err != nil {
+		return 0, false
+	}
+	return pid, true
+}
+
+// writeDeviceIDFile writes a complete id+"\n" to root/name, checking write,
+// sync, and close errors. On any failure the partial file is removed.
+func writeDeviceIDFile(root *os.Root, name, id string) error {
+	f, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteString(id + "\n"); err != nil {
+		_ = f.Close()
+		_ = root.Remove(name)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = root.Remove(name)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = root.Remove(name)
+		return err
+	}
+	return nil
+}
+
+func tmpDeviceIDName(name string) string {
+	return fmt.Sprintf("%s.tmp.%d.%d", name, os.Getpid(), time.Now().UnixNano())
+}
+
+// readValidDeviceID returns a UUID from root/name, or "" if missing/invalid.
+func readValidDeviceID(root *os.Root, name string) string {
+	raw, err := root.ReadFile(name)
 	if err != nil {
 		return ""
 	}
@@ -238,14 +366,14 @@ func readValidDeviceID(path string) string {
 	return ""
 }
 
-// readValidDeviceIDWithRetry re-reads path briefly so a process that lost the
+// readValidDeviceIDWithRetry re-reads briefly so a process that lost the
 // exclusive create can adopt the winner even if it observed the file before
-// the winner finished writing the UUID.
-func readValidDeviceIDWithRetry(path string) string {
+// the winner finished publishing the UUID.
+func readValidDeviceIDWithRetry(root *os.Root, name string) string {
 	const attempts = 40
 	const delay = 5 * time.Millisecond
 	for i := 0; i < attempts; i++ {
-		if id := readValidDeviceID(path); id != "" {
+		if id := readValidDeviceID(root, name); id != "" {
 			return id
 		}
 		time.Sleep(delay)

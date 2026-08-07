@@ -1,6 +1,7 @@
 package kimiidentity
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -294,14 +295,46 @@ func TestLoadOrCreateDeviceIDRepairsStaleRepairLock(t *testing.T) {
 	_ = f.Close() // abandoned target file
 
 	lockPath := path + ".lock"
+	// Empty lock contents are treated as abandoned (unparseable holder) and
+	// reclaimed. A live holder's "<pid>.<nano>" token is not reclaimed.
 	lockF, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = lockF.Close() // abandoned lock file
-	// Backdate lock file mtime to make it stale (> 1s)
-	oldTime := time.Now().Add(-5 * time.Second)
-	if err := os.Chtimes(lockPath, oldTime, oldTime); err != nil {
+	_ = lockF.Close()
+
+	got := loadOrCreateDeviceIDAt(path)
+	if !isUUID(got) {
+		t.Fatalf("repaired id %q is not a UUID", got)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read repaired file: %v", err)
+	}
+	if persisted := strings.TrimSpace(string(raw)); persisted != got {
+		t.Fatalf("persisted %q, want repaired %q", persisted, got)
+	}
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Fatalf("repair lock should be cleaned up after reclaim+repair: err=%v", err)
+	}
+}
+
+func TestLoadOrCreateDeviceIDRepairsDeadPIDRepairLock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "zero", "kimi-device-id")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	lockPath := path + ".lock"
+	// Well-formed token with a non-positive PID is treated as dead (same as a
+	// crashed holder). Avoid inventing a high PID that might be live.
+	if err := os.WriteFile(lockPath, []byte("0.12345\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -315,6 +348,23 @@ func TestLoadOrCreateDeviceIDRepairsStaleRepairLock(t *testing.T) {
 	}
 	if persisted := strings.TrimSpace(string(raw)); persisted != got {
 		t.Fatalf("persisted %q, want repaired %q", persisted, got)
+	}
+}
+
+func TestLockHolderAlive(t *testing.T) {
+	if lockHolderAlive([]byte("")) {
+		t.Fatal("empty lock should not be treated as live")
+	}
+	if lockHolderAlive([]byte("not-a-token")) {
+		t.Fatal("unparseable lock should not be treated as live")
+	}
+	if lockHolderAlive([]byte("0.1")) {
+		t.Fatal("non-positive pid should not be treated as live")
+	}
+	// Our own PID must be treated as live so we never reclaim our own lock.
+	self := fmt.Sprintf("%d.%d", os.Getpid(), time.Now().UnixNano())
+	if !lockHolderAlive([]byte(self)) {
+		t.Fatalf("self pid token %q should be live", self)
 	}
 }
 

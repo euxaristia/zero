@@ -40,6 +40,11 @@ type Manager struct {
 	// token. refreshMu guards the map (M7).
 	refreshMu    sync.Mutex
 	refreshLocks map[string]*sync.Mutex
+	// deviceCommitMu serializes the post-poll cancel check with token Save in
+	// CompleteDeviceLogin so a canceled attempt cannot interleave its commit
+	// with another attempt's, and a cancel observed before the critical
+	// section is never followed by a Save on that call.
+	deviceCommitMu sync.Mutex
 }
 
 // ManagerOptions configures a Manager.
@@ -198,6 +203,13 @@ func (m *Manager) CompleteDeviceLogin(ctx context.Context, provider string, cfg 
 	if err != nil {
 		return Status{}, err
 	}
+	// Serialize cancel observation with the token commit. A canceled device
+	// login must not overwrite stored credentials: take the commit lock, then
+	// re-check ctx before Save so a cancel that landed during the poll (or
+	// between poll return and this section) is honored. Concurrent
+	// CompleteDeviceLogin calls also cannot interleave their commits.
+	m.deviceCommitMu.Lock()
+	defer m.deviceCommitMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return Status{}, err
 	}

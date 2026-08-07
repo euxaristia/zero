@@ -171,13 +171,21 @@ func providerExtraHeaders(name string, overriddenEndpoints ...string) map[string
 	return nil
 }
 
+// isCanonicalKimiHost reports whether urlStr's host is an explicitly approved
+// Kimi OAuth/API endpoint. Only the hosts this package's preset and managed
+// coding path talk to are allowed; arbitrary *.kimi.com / *.moonshot.cn
+// subdomains must not receive the persistent device identity.
 func isCanonicalKimiHost(urlStr string) bool {
 	u, err := url.Parse(urlStr)
 	if err != nil || u.Hostname() == "" {
 		return false
 	}
-	host := strings.ToLower(u.Hostname())
-	return host == "auth.kimi.com" || host == "api.kimi.com" || host == "kimi.com" || strings.HasSuffix(host, ".kimi.com") || strings.HasSuffix(host, ".moonshot.cn")
+	switch strings.ToLower(u.Hostname()) {
+	case "auth.kimi.com", "api.kimi.com":
+		return true
+	default:
+		return false
+	}
 }
 
 // kimiExtraHeaders returns the X-Msh-* vendor-identity headers Kimi Code's
