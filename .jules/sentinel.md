@@ -1,0 +1,4 @@
+## 2026-08-07 - Add ReadHeaderTimeout to Prevent Slowloris Attacks
+**Vulnerability:** Found multiple `http.Server` instances without a configured `ReadHeaderTimeout` in `internal/mcp/oauth.go`, `internal/oauth/loopback.go`, `internal/provideroauth/openrouter.go`, and `internal/tools/bash_tool_test.go`, causing gosec G112 warnings and potential Slowloris (CWE-400) vulnerability.
+**Learning:** Default `http.Server` configurations do not enforce timeouts for reading request headers. This gap can be exploited by an attacker sending headers slowly to keep connections open, exhausting server resources.
+**Prevention:** Always explicitly configure `ReadHeaderTimeout` (e.g., `10 * time.Second`) when initializing an `http.Server` to ensure timely request header reading.
