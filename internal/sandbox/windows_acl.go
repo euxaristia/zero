@@ -136,11 +136,13 @@ func BuildWindowsACLPlan(config WindowsSandboxCommandConfig) (WindowsACLPlan, er
 	// permanently disabled (see runWindowsSandboxCommand): preflight DACL
 	// snapshots cannot enforce a write boundary for the command's lifetime.
 	// Do not stamp new machine-wide DenyWrite ACEs for a feature that never
-	// enables. Still revoke the stable read-only capability SID on configured
-	// write roots when DenyRead is set on the elevated tier, so hosts that
-	// ran earlier PR builds (which did apply shared/descendant denies) do not
-	// keep a stale deny that wins over the write root's Allow.
-	if config.SandboxLevel == WindowsSandboxLevelRestrictedToken && len(config.PermissionProfile.FileSystem.DenyRead) > 0 && len(writeCapabilities) > 0 {
+	// enables. Still revoke the stable read-only capability SID on every
+	// elevated write root so hosts that ran earlier PR builds (which did apply
+	// shared/descendant denies) do not keep a stale deny that wins over the
+	// write root's Allow. Production callers reject DenyRead before planning,
+	// so gating this cleanup on DenyRead would leave it unreachable; revoking
+	// a missing ACE is a safe no-op.
+	if config.SandboxLevel == WindowsSandboxLevelRestrictedToken && len(writeCapabilities) > 0 {
 		caps, err := LoadOrCreateWindowsCapabilitySIDs(config.SandboxHome)
 		if err != nil {
 			return WindowsACLPlan{}, err
@@ -158,31 +160,6 @@ func BuildWindowsACLPlan(config WindowsSandboxCommandConfig) (WindowsACLPlan, er
 	}
 
 	return WindowsACLPlan{Entries: dedupeWindowsACLEntries(entries)}, nil
-}
-
-// windowsPathUnderAnyRoot reports whether path is exactly, or nested under, one
-// of the configured write-root capabilities. A shared-path deny must skip both
-// cases: denying a root that IS a write root would block the workspace outright,
-// and denying a root that merely CONTAINS one (e.g. a shared path of
-// C:\Users\Public when C:\Users itself is a configured write root) would place
-// an explicit Deny ahead of that root's Allow for every broadened token,
-// winning under Windows' deny-before-allow evaluation and jailing a directory
-// the user explicitly configured as writable.
-func windowsPathUnderAnyRoot(path string, capabilities []windowsWriteRootCapability) bool {
-	key := windowsCapabilityPathKey(path)
-	if key == "" {
-		return false
-	}
-	for _, cap := range capabilities {
-		rootKey := windowsCapabilityPathKey(cap.Root)
-		if rootKey == "" {
-			continue
-		}
-		if key == rootKey || strings.HasPrefix(key, rootKey+`\`) {
-			return true
-		}
-	}
-	return false
 }
 
 type windowsWriteRootCapability struct {

@@ -68,10 +68,15 @@ func TestBuildWindowsACLPlanForWorkspaceWriteProfile(t *testing.T) {
 }
 
 // TestBuildWindowsACLPlanOmitsSharedDenyPathsWithoutDenyRead pins that
-// profiles without DenyRead never touch shared system-path DACLs or the
-// stable read-only SID revoke path.
+// profiles without DenyRead never stamp shared system-path DenyWrite ACEs.
+// Elevated write roots still get a migration revoke of the stable read-only
+// SID so stale denies from earlier PR builds cannot shadow new Allows.
 func TestBuildWindowsACLPlanOmitsSharedDenyPathsWithoutDenyRead(t *testing.T) {
 	home := t.TempDir()
+	caps, err := LoadOrCreateWindowsCapabilitySIDs(home)
+	if err != nil {
+		t.Fatalf("LoadOrCreateWindowsCapabilitySIDs: %v", err)
+	}
 	plan, err := BuildWindowsACLPlan(WindowsSandboxCommandConfig{
 		SandboxHome:    home,
 		WorkspaceRoots: []string{`C:\workspace`},
@@ -88,11 +93,7 @@ func TestBuildWindowsACLPlanOmitsSharedDenyPathsWithoutDenyRead(t *testing.T) {
 		t.Fatalf("BuildWindowsACLPlan: %v", err)
 	}
 	assertNoSharedSystemDenyWrites(t, plan)
-	for _, entry := range plan.Entries {
-		if entry.Action == WindowsACLRevokeCapability {
-			t.Fatalf("plan without DenyRead = %#v, want no WindowsACLRevokeCapability entry", plan.Entries)
-		}
-	}
+	assertWindowsACLRevoke(t, plan, `C:\workspace`, caps.ReadOnly, true)
 }
 
 // TestBuildWindowsACLPlanOmitsSharedDenyPathsWhenUnelevated pins that the
@@ -198,8 +199,9 @@ func TestBuildWindowsACLPlanDisablesSharedDenyPathDescendantScan(t *testing.T) {
 
 // TestBuildWindowsACLPlanRevokesStaleSharedDenyOnWriteRoot pins cleanup for
 // hosts that ran earlier PR builds which stamped shared/descendant DenyWrite
-// ACEs: write roots still get an unconditional revoke of the stable read-only
-// SID (with RevokeDescendants) when DenyRead is configured on the elevated tier.
+// ACEs: elevated write roots get an unconditional revoke of the stable
+// read-only SID (with RevokeDescendants), independent of DenyRead (which
+// production callers reject before planning).
 func TestBuildWindowsACLPlanRevokesStaleSharedDenyOnWriteRoot(t *testing.T) {
 	home := t.TempDir()
 	caps, err := LoadOrCreateWindowsCapabilitySIDs(home)
@@ -217,7 +219,6 @@ func TestBuildWindowsACLPlanRevokesStaleSharedDenyOnWriteRoot(t *testing.T) {
 			FileSystem: FileSystemPolicy{
 				Kind:       FileSystemRestricted,
 				WriteRoots: []WritableRoot{{Root: publicDir}, {Root: promotedDescendant}},
-				DenyRead:   []string{`C:\workspace\secret-read`},
 			},
 			Network: NetworkPolicy{Mode: NetworkDeny},
 		},
@@ -228,32 +229,6 @@ func TestBuildWindowsACLPlanRevokesStaleSharedDenyOnWriteRoot(t *testing.T) {
 	assertNoSharedSystemDenyWrites(t, plan)
 	for _, root := range []string{publicDir, promotedDescendant} {
 		assertWindowsACLRevoke(t, plan, root, caps.ReadOnly, true)
-	}
-}
-
-// TestBuildWindowsACLPlanOmitsRevokeCapabilityWithoutDenyRead pins that the
-// stale-deny reconciliation entry is scoped to DenyRead elevated profiles.
-func TestBuildWindowsACLPlanOmitsRevokeCapabilityWithoutDenyRead(t *testing.T) {
-	home := t.TempDir()
-	plan, err := BuildWindowsACLPlan(WindowsSandboxCommandConfig{
-		SandboxHome:    home,
-		WorkspaceRoots: []string{`C:\workspace`},
-		SandboxLevel:   WindowsSandboxLevelRestrictedToken,
-		PermissionProfile: PermissionProfile{
-			FileSystem: FileSystemPolicy{
-				Kind:       FileSystemRestricted,
-				WriteRoots: []WritableRoot{{Root: `C:\workspace`}},
-			},
-			Network: NetworkPolicy{Mode: NetworkDeny},
-		},
-	})
-	if err != nil {
-		t.Fatalf("BuildWindowsACLPlan: %v", err)
-	}
-	for _, entry := range plan.Entries {
-		if entry.Action == WindowsACLRevokeCapability {
-			t.Fatalf("plan without DenyRead = %#v, want no WindowsACLRevokeCapability entry", plan.Entries)
-		}
 	}
 }
 

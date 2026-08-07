@@ -159,19 +159,20 @@ func windowsRevokeStaleDescendantDenies(root, denySID string) []windowsACLSnapsh
 				return snapshots
 			}
 			visited++
-			if denied, err := windowsPathDeniesCapabilitySID(child, denySID); err == nil && denied {
-				snapshot, applied, err := applyWindowsACLPathGroup(windowsACLPathGroup{
-					Path: child,
-					Entries: []WindowsACLEntry{{
-						Action:     WindowsACLRevokeCapability,
-						Path:       child,
-						Capability: denySID,
-						NoInherit:  true,
-					}},
-				})
-				if err == nil && applied {
-					snapshots = append(snapshots, snapshot)
-				}
+			// Revoking a SID with no matching ACE is a safe no-op. A pre-check
+			// keyed on complete write-deny coverage would also skip a partial
+			// stale deny that still blocks writes on a promoted write root.
+			snapshot, applied, err := applyWindowsACLPathGroup(windowsACLPathGroup{
+				Path: child,
+				Entries: []WindowsACLEntry{{
+					Action:     WindowsACLRevokeCapability,
+					Path:       child,
+					Capability: denySID,
+					NoInherit:  true,
+				}},
+			})
+			if err == nil && applied {
+				snapshots = append(snapshots, snapshot)
 			}
 			if !entry.IsDir() {
 				continue
@@ -402,9 +403,6 @@ func windowsPreservedReadDenyAccessEntries(oldDACL *windows.ACL, wantSID *window
 		if ace.Header.AceType != windows.ACCESS_DENIED_ACE_TYPE && ace.Header.AceType != windowsAccessDeniedObjectAceType {
 			continue
 		}
-		if ace.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0 {
-			continue
-		}
 		sid, ok := windowsAceSID(ace)
 		if !ok || !sid.Equals(wantSID) {
 			continue
@@ -413,10 +411,15 @@ func windowsPreservedReadDenyAccessEntries(oldDACL *windows.ACL, wantSID *window
 			continue
 		}
 		// Preserve non-write DENY ACEs (typically DenyRead for the stable
-		// sandbox-home ReadOnly SID).
+		// sandbox-home ReadOnly SID), keeping their original inheritance
+		// scope rather than promoting every variant to container+object or
+		// dropping inherit-only ACEs that SET_ACCESS zero-mask already cleared.
 		inheritance := uint32(0)
-		if isDir && ace.Header.AceFlags&(windows.OBJECT_INHERIT_ACE|windows.CONTAINER_INHERIT_ACE) != 0 {
-			inheritance = windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT
+		if isDir {
+			inheritance = uint32(ace.Header.AceFlags) & (windows.OBJECT_INHERIT_ACE |
+				windows.CONTAINER_INHERIT_ACE |
+				windows.NO_PROPAGATE_INHERIT_ACE |
+				windows.INHERIT_ONLY_ACE)
 		}
 		out = append(out, windows.EXPLICIT_ACCESS{
 			AccessPermissions: ace.Mask,

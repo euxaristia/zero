@@ -307,7 +307,7 @@ func setSelfListDirectoryAccess(t *testing.T, path string, deny bool) {
 	if err != nil {
 		t.Fatalf("DACL %s: %v", path, err)
 	}
-	var targetOldDACL *windows.ACL = oldDACL
+	targetOldDACL := oldDACL
 	if deny {
 		targetOldDACL = nil
 	}
@@ -699,9 +699,17 @@ func TestWindowsEnumerateWritableDescendantsSkipsJunctions(t *testing.T) {
 	}
 }
 
-func TestWindowsEnsureSharedDescendantCoverageDeduplicatesRootDeny(t *testing.T) {
+// TestApplyWindowsSharedDescendantDeniesIdempotentRootDeny pins that a second
+// apply on an already-covered root does not stack another DenyWrite ACE.
+func TestApplyWindowsSharedDescendantDeniesIdempotentRootDeny(t *testing.T) {
 	dir := t.TempDir()
-	sid := "S-1-1-0"
+	// Synthetic capability SID so DenyWrite's WRITE_DAC/DELETE bits do not
+	// lock the test out of its own temp dir.
+	caps, err := LoadOrCreateWindowsCapabilitySIDs(t.TempDir())
+	if err != nil {
+		t.Fatalf("LoadOrCreateWindowsCapabilitySIDs: %v", err)
+	}
+	sid := caps.ReadOnly
 
 	group := windowsACLPathGroup{
 		Path: dir,
@@ -709,21 +717,56 @@ func TestWindowsEnsureSharedDescendantCoverageDeduplicatesRootDeny(t *testing.T)
 			Action:     WindowsACLDenyWrite,
 			Path:       dir,
 			Capability: sid,
+			NoInherit:  true,
 		}},
 	}
 	if _, _, err := applyWindowsACLPathGroup(group); err != nil {
 		t.Fatal(err)
 	}
+	countBefore := denyACECountForSID(t, dir, sid)
 
-	denied, err := windowsPathDeniesCapabilitySID(dir, sid)
-	if err != nil || !denied {
-		t.Fatalf("expected root to be denied before re-check, denied=%v, err=%v", denied, err)
+	// A second full DenyWrite merge for the same SID must leave the ACE count
+	// unchanged (complete coverage skips re-applying).
+	if _, _, err := applyWindowsACLPathGroup(group); err != nil {
+		t.Fatal(err)
 	}
-	// Second check must still report complete coverage so command-time
-	// windowsEnsureSharedDescendantCoverage skips SetEntriesInAclW rather
-	// than stacking another permanent DENY_ACCESS ACE on the root.
-	deniedAgain, err := windowsPathDeniesCapabilitySID(dir, sid)
-	if err != nil || !deniedAgain {
-		t.Fatalf("expected idempotent complete deny on re-check, denied=%v, err=%v", deniedAgain, err)
+	countAfter := denyACECountForSID(t, dir, sid)
+	if countAfter != countBefore {
+		t.Fatalf("deny ACE count for %q changed from %d to %d after second apply", sid, countBefore, countAfter)
 	}
+}
+
+// denyACECountForSID counts ACCESS_DENIED ACEs naming wantSID on path's DACL.
+func denyACECountForSID(t *testing.T, path, wantSID string) int {
+	t.Helper()
+	want, err := windows.StringToSid(wantSID)
+	if err != nil {
+		t.Fatalf("StringToSid %q: %v", wantSID, err)
+	}
+	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		t.Fatalf("GetNamedSecurityInfo %s: %v", path, err)
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		t.Fatalf("DACL %s: %v", path, err)
+	}
+	if dacl == nil {
+		return 0
+	}
+	count := 0
+	for index := uint16(0); index < dacl.AceCount; index++ {
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if err := windows.GetAce(dacl, uint32(index), &ace); err != nil {
+			t.Fatalf("GetAce %d of %s: %v", index, path, err)
+		}
+		if ace.Header.AceType != windows.ACCESS_DENIED_ACE_TYPE {
+			continue
+		}
+		sid, ok := windowsAceSID(ace)
+		if ok && sid.Equals(want) {
+			count++
+		}
+	}
+	return count
 }

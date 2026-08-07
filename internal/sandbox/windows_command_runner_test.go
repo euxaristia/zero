@@ -24,9 +24,15 @@ func TestWindowsDenyReadRestrictedTokenUnsupported(t *testing.T) {
 			t.Fatalf("expected unsupported error for %s DenyRead profile", level)
 		}
 		msg := err.Error()
-		for _, want := range []string{"DenyRead", "not supported", "restricted-token", "unelevated", `C:\secret`} {
+		for _, want := range []string{"DenyRead", "not supported", "restricted-token", "unelevated", "path count: 2"} {
 			if !strings.Contains(msg, want) {
 				t.Fatalf("%s error %q missing %q", level, msg, want)
+			}
+		}
+		// DenyRead often names credential or private-file paths; keep them out of stderr.
+		for _, secret := range []string{`C:\secret`, `D:\private`} {
+			if strings.Contains(msg, secret) {
+				t.Fatalf("%s error leaked DenyRead path %q: %q", level, secret, msg)
 			}
 		}
 		// Must not point users at the other restricted-token tier as a workaround.

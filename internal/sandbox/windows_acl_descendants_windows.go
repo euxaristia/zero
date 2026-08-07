@@ -12,91 +12,41 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// The shared-root compensating deny (windows_acl.go) puts a direct,
-// non-inheriting DenyWrite on each of C:\, %ProgramData%, %SystemRoot%\Temp,
-// and C:\Users\Public. That blocks new writes directly under those objects, but
-// a Windows access check for an EXISTING child never evaluates a non-inherited
-// ACE on the child's parent, so a pre-existing descendant that independently
-// grants BUILTIN\Users or Authenticated Users write stays writable once the
-// elevated fully-restricted (DenyRead) token is broadened with those two groups,
-// a write outside every configured write root. This file enumerates those
-// existing writable descendants and denies each one directly.
+// Shared-root DenyWrite and Users/Authenticated Users SID broadening are no
+// longer shipped: BuildWindowsACLPlan does not stamp machine-wide denies on
+// C:\, %ProgramData%, %SystemRoot%\Temp, or C:\Users\Public, and the restricted
+// token is never broadened with those groups. This file keeps the descendant
+// walker and related helpers for (1) migration cleanup of stale denies left by
+// earlier PR builds and (2) Windows regression tests of that walker.
 //
-// Coverage rules (fail closed):
+// Historical coverage rules the walker still implements (fail closed when used):
 //
-//   - Every directory under a shared root is considered for descent within the
-//     depth/entry caps, whether or not the parent itself is Users-writable. A
-//     depth-N writable child under non-writable ancestors is a real escape and
-//     must be found (see CodeRabbit/jatmn review).
+//   - Every directory under a root is considered for descent within the
+//     depth/entry caps, whether or not the parent itself is Users-writable.
 //   - Hitting windowsDescendantScanMaxDepth or windowsDescendantScanMaxDirs
-//     means unexamined territory remains: the scan returns an error so setup
-//     and pre-broaden revalidation cannot certify a partial walk as clean.
-//     These bounds must be large enough that a stock C:\ (with its Windows,
-//     Program Files, and WinSxS trees) actually completes — see the comment on
-//     the vars below for the reasoning and the honest limits of that estimate.
+//     means unexamined territory remains: the scan returns an error rather than
+//     certifying a partial walk as clean.
 //   - Reparse points (junctions, symlinks, volume mount points) use a
-//     no-follow, identity-aware policy (see jatmn's review). Path APIs without
-//     FILE_FLAG_OPEN_REPARSE_POINT transparently resolve through a directory
-//     junction or symlink, so treating a reparse as an ordinary directory
-//     would either hard-fail on deliberately non-listable compatibility
-//     junctions (C:\Documents and Settings, ProgramData\Application Data, …)
-//     or re-walk an already-scanned tree through the target and blow the
-//     depth/entry cap. The walker therefore:
+//     no-follow, identity-aware policy (see jatmn's review). The walker:
 //     1. Detects reparse points via FILE_ATTRIBUTE_REPARSE_POINT (and the
 //     ModeSymlink/ModeIrregular bits ReadDir already reports) and never
 //     inspects their DACL, never applies a deny, and never descends.
 //     2. Records the (volume serial, file index) identity of every real
-//     directory it does enter, so an alternate path to the same object
-//     (short name, case variant, or any residual reparse resolution) is
+//     directory it does enter, so an alternate path to the same object is
 //     skipped rather than re-enumerated.
-//     Stock compatibility junctions always have a real path sibling that the
-//     walk reaches separately (Documents and Settings -> Users); skipping the
-//     reparse does not leave that tree unexamined.
 //   - A directory this process cannot list, or a child whose DACL it cannot
 //     read, is fail-closed UNLESS the basename is a known SYSTEM-exclusive
-//     Windows directory (e.g. "System Volume Information") AND it sits at the
-//     one place that basename is ever legitimately the real thing: directly
-//     under an actual drive letter root (windowsPathIsDriveRootPath). Without
-//     that allowlist, elevated setup would fail on every real machine; without
-//     the root-level scoping, a same-named directory anywhere else in the
-//     tree (nested under ProgramData or Public, whether by installer accident
-//     or deliberately) would be silently skipped instead of failing closed —
-//     see jatmn's review.
-//   - Stock system trees under the drive root (Windows, Program Files, ...)
-//     are NOT pruned by basename: a directory's own DACL being non-writable
-//     says nothing about whether an installer-created descendant several
-//     levels down independently grants Users/AuthUsers write, so certifying
-//     a subtree clean from its root DACL alone would miss exactly that
-//     escape (see jatmn's review). Every directory is descended subject only
-//     to the depth/entry caps above; exhausting those caps on a genuinely
-//     huge stock tree is a fail-closed error, not a silent partial pass.
-//
-// Staleness: setup alone is not enough. Non-inheriting denies only cover the
-// filesystem state at apply time. The elevated command runner revalidates and
-// reapplies this scan immediately before broadening the restricted token
-// (windowsEnsureSharedDescendantCoverage); if coverage cannot be re-established,
-// the token stays on the narrow SID set.
+//     Windows directory (e.g. "System Volume Information") AND it sits
+//     directly under an actual drive letter root (windowsPathIsDriveRootPath).
 //
 // Basename policies live in windows_acl_descendants.go so non-Windows tests can
 // pin them without Win32. Bounds are vars so Windows tests can lower them.
 var (
 	windowsDescendantScanMaxDepth = 48
 	// windowsDescendantScanMaxDirs bounds the total files+directories the scan
-	// will inspect below a single shared root. A stock Windows install can
-	// easily have tens to hundreds of thousands of objects under C:\Windows
-	// alone (WinSxS in particular), so the previous 8,192 cap made every
-	// elevated DenyRead setup fail on a normal system drive (jatmn's review).
-	// This is raised to a size intended to comfortably cover a typical stock
-	// C:\Windows + Program Files + Program Files (x86) tree while still
-	// bounding worst-case work to a finite number rather than removing the
-	// cap outright. It is a reasoned estimate, not a measurement: this fix was
-	// written and cross-compiled without access to a real Windows machine, so
-	// the actual object count on any given box (and the wall-clock cost of
-	// walking it, since windowsEnsureSharedDescendantCoverage repeats this
-	// scan before every DenyRead command) could not be verified directly.
-	// Failing closed here only costs functionality (the narrow SID set), never
-	// safety, so an unusually large tree is a safe, if inconvenient, failure
-	// mode rather than a security regression.
+	// will inspect below a single root. Kept large enough for stock system
+	// trees while still bounding worst-case work; the walker is retained for
+	// migration cleanup and tests, not live elevated DenyRead setup.
 	windowsDescendantScanMaxDirs = 500000
 )
 
@@ -482,69 +432,6 @@ func windowsPathIsReparsePoint(path string) bool {
 		return false
 	}
 	return attrs&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-// windowsEnsureSharedDescendantCoverage re-enumerates the shared deny roots and
-// ensures every currently Users/AuthUsers-writable descendant carries a direct
-// DenyWrite for the stable read-only capability SID. It is called immediately
-// before a command broadens the restricted token so a child created after
-// `zero sandbox setup` cannot remain an uncovered write-jail escape.
-//
-// It also revalidates the direct deny on each shared ROOT itself (C:\,
-// ProgramData, Windows\Temp, Public), not just its descendants: this was
-// previously left unchecked, so an installer or service that removed the root
-// deny after setup would leave the descendant walk reporting no holes while
-// the root itself had silently reopened, and the runner would still broaden
-// the token (see jatmn's review).
-//
-// Prefer reapplying denies (same permanent posture as elevated setup) for both
-// the root and its descendants. When reapply fails — typically because the
-// command process lacks WRITE_DAC on a system path — fall back to a
-// read-only check: if the root's own deny is missing, or any writable
-// descendant still lacks the synthetic deny, coverage is incomplete and the
-// caller must not broaden. Fail closed on enumeration errors either way.
-func windowsEnsureSharedDescendantCoverage(config WindowsSandboxCommandConfig) error {
-	plan, err := BuildWindowsACLPlan(config)
-	if err != nil {
-		return err
-	}
-	writeRoots := windowsPlanAllowWriteRoots(plan)
-	for _, group := range groupWindowsACLPlanByPath(plan) {
-		denySID, ok := windowsGroupScanDescendantsSID(group)
-		if !ok {
-			continue
-		}
-		if _, err := os.Stat(group.Path); err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return fmt.Errorf("stat shared deny root %s: %w", group.Path, err)
-		}
-		rootDenied, checkErr := windowsPathDeniesCapabilitySID(group.Path, denySID)
-		if checkErr != nil {
-			return checkErr
-		}
-		if !rootDenied {
-			if _, _, err := applyWindowsACLPathGroup(group); err != nil {
-				denied, denyErr := windowsPathDeniesCapabilitySID(group.Path, denySID)
-				if denyErr != nil || !denied {
-					return fmt.Errorf("shared root write deny missing on %s: %w", group.Path, err)
-				}
-				// Reapply failed but the root's own deny is still effectively in
-				// place, so the write jail continues to hold for this root.
-			}
-		}
-		if _, err := applyWindowsSharedDescendantDenies(group.Path, denySID, writeRoots); err == nil {
-			continue
-		} else if holes, holeErr := windowsUncoveredWritableDescendants(group.Path, denySID, writeRoots); holeErr != nil {
-			return holeErr
-		} else if len(holes) > 0 {
-			return fmt.Errorf("shared descendant write coverage incomplete under %s (e.g. %s): %w", group.Path, holes[0], err)
-		}
-		// Reapply failed but every currently writable descendant already carries
-		// the synthetic deny, so the write jail still holds for this root.
-	}
-	return nil
 }
 
 // windowsUncoveredWritableDescendants returns Users/AuthUsers-writable

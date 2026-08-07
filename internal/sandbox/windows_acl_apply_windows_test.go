@@ -181,6 +181,113 @@ func TestApplyWindowsACLRevokePreservesDenyRead(t *testing.T) {
 	}
 }
 
+// TestApplyWindowsACLPlanRevokeDescendantsClearsChildDeny is the regression for
+// the RevokeDescendants walk: promoting a root to a write root must clear a
+// stale direct deny an earlier run left on an existing child, not only the root
+// path itself. Also pins reparse skip and the depth cap as best-effort bounds.
+func TestApplyWindowsACLPlanRevokeDescendantsClearsChildDeny(t *testing.T) {
+	caps, err := LoadOrCreateWindowsCapabilitySIDs(t.TempDir())
+	if err != nil {
+		t.Fatalf("LoadOrCreateWindowsCapabilitySIDs: %v", err)
+	}
+	staleSID := caps.ReadOnly
+	allowSID, err := LoadOrCreateWindowsCapabilitySIDs(t.TempDir())
+	if err != nil {
+		t.Fatalf("LoadOrCreateWindowsCapabilitySIDs (allow): %v", err)
+	}
+
+	root := t.TempDir()
+	child := mkdir(t, filepath.Join(root, "child"))
+	deep := mkdir(t, filepath.Join(child, "deep"))
+	// Stale full DenyWrite on the direct child (the primary cleanup target).
+	if _, _, err := applyWindowsACLPathGroup(windowsACLPathGroup{
+		Path: child,
+		Entries: []WindowsACLEntry{{
+			Action:     WindowsACLDenyWrite,
+			Path:       child,
+			Capability: staleSID,
+			NoInherit:  true,
+		}},
+	}); err != nil {
+		t.Fatalf("apply stale deny on child: %v", err)
+	}
+	// Partial write deny on deep: the old complete-coverage pre-check would
+	// skip this; unconditional revoke must still clear it.
+	denyCapabilityMask(t, deep, staleSID, windows.FILE_WRITE_ATTRIBUTES)
+	if !dirDeniesSID(t, child, staleSID) {
+		t.Fatal("fixture: child missing full stale deny")
+	}
+	if denyACECountForSID(t, deep, staleSID) == 0 {
+		t.Fatal("fixture: deep missing partial stale deny")
+	}
+
+	// Junction under root: walker must skip it (best-effort) without failing.
+	juncTarget := mkdir(t, filepath.Join(t.TempDir(), "junc-target"))
+	junc := filepath.Join(root, "junc")
+	if out, err := exec.Command("cmd", "/c", "mklink", "/J", junc, juncTarget).CombinedOutput(); err != nil {
+		t.Logf("skipping junction sub-check (mklink /J unavailable): %v %s", err, strings.TrimSpace(string(out)))
+	} else {
+		t.Cleanup(func() { _ = os.Remove(junc) })
+		if !windowsPathIsReparsePoint(junc) {
+			t.Fatalf("fixture: %q is not a reparse point", junc)
+		}
+	}
+
+	cleanup, err := applyWindowsACLPlan(WindowsACLPlan{Entries: []WindowsACLEntry{
+		{Action: WindowsACLAllowWrite, Path: root, Capability: allowSID.ReadOnly},
+		{
+			Action:            WindowsACLRevokeCapability,
+			Path:              root,
+			Capability:        staleSID,
+			NoInherit:         true,
+			RevokeDescendants: true,
+		},
+	}})
+	if err != nil {
+		t.Fatalf("applyWindowsACLPlan: %v", err)
+	}
+	t.Cleanup(func() { _ = cleanup() })
+
+	if dirDeniesSID(t, child, staleSID) {
+		t.Fatalf("%q still carries full stale deny after RevokeDescendants", child)
+	}
+	if denyACECountForSID(t, deep, staleSID) != 0 {
+		t.Fatalf("%q still carries partial stale deny after RevokeDescendants", deep)
+	}
+
+	// Depth cap: with max depth 1 the walker revokes root's children but does
+	// not enqueue them, so a nested deny under a new root is left in place.
+	cappedRoot := t.TempDir()
+	cappedChild := mkdir(t, filepath.Join(cappedRoot, "level1"))
+	cappedDeep := mkdir(t, filepath.Join(cappedChild, "level2"))
+	if _, _, err := applyWindowsACLPathGroup(windowsACLPathGroup{
+		Path: cappedDeep,
+		Entries: []WindowsACLEntry{{
+			Action:     WindowsACLDenyWrite,
+			Path:       cappedDeep,
+			Capability: staleSID,
+			NoInherit:  true,
+		}},
+	}); err != nil {
+		t.Fatalf("apply stale deny on capped deep: %v", err)
+	}
+	oldDepth := windowsDescendantScanMaxDepth
+	windowsDescendantScanMaxDepth = 1
+	t.Cleanup(func() { windowsDescendantScanMaxDepth = oldDepth })
+	if _, err := applyWindowsACLPlan(WindowsACLPlan{Entries: []WindowsACLEntry{{
+		Action:            WindowsACLRevokeCapability,
+		Path:              cappedRoot,
+		Capability:        staleSID,
+		NoInherit:         true,
+		RevokeDescendants: true,
+	}}}); err != nil {
+		t.Fatalf("applyWindowsACLPlan (depth cap): %v", err)
+	}
+	if !dirDeniesSID(t, cappedDeep, staleSID) {
+		t.Fatal("depth cap should leave level2 deny in place when max depth is 1")
+	}
+}
+
 // dirDeniesReadSID reports whether path's DACL has a DENY ACE for wantSID whose
 // mask covers FILE_GENERIC_READ (DenyRead shape) without the full write-probe
 // mask of experimental DenyWrite.

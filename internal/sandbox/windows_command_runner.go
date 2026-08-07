@@ -3,7 +3,6 @@ package sandbox
 import (
 	"fmt"
 	"io"
-	"strings"
 )
 
 func RunWindowsSandboxCommandRunner(args []string, stderr io.Writer) int {
@@ -11,6 +10,13 @@ func RunWindowsSandboxCommandRunner(args []string, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintln(stderr, WindowsSandboxCommandRunnerName+": "+err.Error())
 		return 2
+	}
+	// Reject unsupported DenyRead profiles before minting persistent capability
+	// SID state under SandboxHome (defense in depth: runWindowsSandboxCommand
+	// also checks, but only after LoadOrCreateWindowsCapabilitySIDs).
+	if err := windowsDenyReadRestrictedTokenUnsupported(config); err != nil {
+		fmt.Fprintln(stderr, WindowsSandboxCommandRunnerName+": "+err.Error())
+		return 1
 	}
 	if _, err := LoadOrCreateWindowsCapabilitySIDs(config.SandboxHome); err != nil {
 		fmt.Fprintln(stderr, WindowsSandboxCommandRunnerName+": "+err.Error())
@@ -50,7 +56,7 @@ func windowsDenyReadRestrictedTokenUnsupportedProfile(profile PermissionProfile)
 			"Windows cannot load, and adding those groups would admit their existing "+
 			"write grants outside WriteRoots. "+
 			"Use `--sandbox forbid`, omit DenyRead, or wait for access-time confinement "+
-			"(AppContainer/LPAC-style). Configured DenyRead paths: %s",
-		strings.Join(profile.FileSystem.DenyRead, ", "),
+			"(AppContainer/LPAC-style). Configured DenyRead path count: %d",
+		len(profile.FileSystem.DenyRead),
 	)
 }
