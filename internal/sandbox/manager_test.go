@@ -191,12 +191,19 @@ func TestSandboxManagerBuildsCommandPlanThroughWindowsRunner(t *testing.T) {
 	windowsSandboxInitialized = func() bool { return true }
 	backend := Backend{Name: BackendWindowsRestrictedToken, Available: true, Executable: `C:\zero\zero-windows-command-runner.exe`, Platform: "windows"}
 	policy := DefaultPolicy()
+	// Build the usual restricted FS profile, then clear DenyRead. On non-Windows
+	// hosts PermissionProfileFromPolicy injects credential-store DenyRead paths,
+	// and the Windows plan path rejects any non-empty DenyRead (PR #640). This
+	// happy-path plan must exercise a valid restricted profile without DenyRead;
+	// rejection coverage lives in TestSandboxManagerRejectsWindowsDenyReadOnBothRestrictedTokenTiers.
+	profile := PermissionProfileFromPolicy(`C:\workspace`, policy, nil)
+	profile.FileSystem.DenyRead = nil
 	manager := NewSandboxManager(SandboxManagerOptions{GOOS: "windows", Backend: backend})
 	plan, err := manager.BuildCommandPlan(SandboxManagerRequest{
 		WorkspaceRoot:     `C:\workspace`,
 		Command:           CommandSpec{Name: "cmd.exe", Args: []string{"/d", "/s", "/c", "dir"}, Dir: `C:\workspace\src`, Env: []string{"PATH=C:\\Tools", "TERM=xterm"}},
 		Policy:            policy,
-		Profile:           PermissionProfileFromPolicy(`C:\workspace`, policy, nil),
+		Profile:           profile,
 		Preference:        SandboxPreferenceAuto,
 		ValidateExecution: true,
 	})

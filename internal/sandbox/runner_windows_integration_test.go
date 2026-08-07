@@ -178,12 +178,14 @@ func TestWindowsUnelevatedRealSandboxSmoke(t *testing.T) {
 	}
 
 	sandboxHome := filepath.Join(root, ".zero-sandbox")
+	// Success path: restricted FS write-jail with no DenyRead. Non-empty DenyRead
+	// is unsupported on both restricted-token tiers under the narrow SID set
+	// (PR #640); the rejection probe below covers that separately.
 	profile := PermissionProfile{
 		FileSystem: FileSystemPolicy{
 			Kind:                 FileSystemRestricted,
 			ReadRoots:            []string{root},
 			WriteRoots:           []WritableRoot{{Root: root, ProtectedMetadataNames: []string{".git", ".zero", ".agents"}}},
-			DenyRead:             []string{privateDir},
 			IncludePlatformRoots: true,
 			AllowTemp:            true,
 		},
