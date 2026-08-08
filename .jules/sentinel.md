@@ -1,0 +1,4 @@
+## 2026-08-04 - False Positive Subprocess Launch Findings
+**Vulnerability:** Found uses of `exec.Command` and `exec.CommandContext` with variable inputs (gosec G204) that were false positives or necessary design choices, rather than security risks, such as invoking `git` locally with args array.
+**Learning:** We need to be careful when assessing G204 in gosec as it flags any subprocess launched with a variable without verifying the provenance. When the invocation originates from trusted local configuration or literal constants, we should suppress the warning via `/* #nosec G204 -- [reason] */` instead of removing the capability which limits valid shell pipes or expanding variables.
+**Prevention:** Apply `/* #nosec G204 -- reason */` selectively to known safe subprocess invocations where arguments are controlled or trusted.
