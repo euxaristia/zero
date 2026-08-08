@@ -96,7 +96,6 @@ type appDeps struct {
 	commitsAhead           func(context.Context, string, string, string) (int, error)
 	isUnbornRemote         func(context.Context, string, string) (bool, error)
 	refreshTrackingRef     func(context.Context, string, string, string) error
-	branchHasUpstream      func(context.Context, string, string) (bool, error)
 	branchUpstreamRemote   func(context.Context, string, string) string
 	branchUpstreamRef      func(context.Context, string, string) string
 	remoteHasBranch        func(context.Context, string, string, string) (bool, error)
@@ -225,9 +224,6 @@ func defaultAppDeps() appDeps {
 		},
 		refreshTrackingRef: func(ctx context.Context, cwd, remote, branch string) error {
 			return zerogit.RefreshTrackingRef(ctx, cwd, remote, branch, nil)
-		},
-		branchHasUpstream: func(ctx context.Context, cwd, branch string) (bool, error) {
-			return zerogit.HasUpstream(ctx, cwd, branch, nil)
 		},
 		branchUpstreamRemote: func(ctx context.Context, cwd, branch string) string {
 			return zerogit.UpstreamRemote(ctx, cwd, branch, nil)
@@ -628,9 +624,6 @@ func fillAppDeps(deps appDeps) appDeps {
 	}
 	if deps.refreshTrackingRef == nil {
 		deps.refreshTrackingRef = defaults.refreshTrackingRef
-	}
-	if deps.branchHasUpstream == nil {
-		deps.branchHasUpstream = defaults.branchHasUpstream
 	}
 	if deps.branchUpstreamRemote == nil {
 		deps.branchUpstreamRemote = defaults.branchUpstreamRemote
