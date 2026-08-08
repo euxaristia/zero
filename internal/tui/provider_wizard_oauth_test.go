@@ -249,9 +249,10 @@ func TestProviderWizardEscCancelsDeviceLoginPoll(t *testing.T) {
 	// The poll command captured the context created for this attempt; run it
 	// now (after Esc) and confirm CompleteDeviceLogin actually observed
 	// cancellation instead of running to completion in the background.
-	msg, ok := cmd().(providerWizardOAuthMsg)
+	raw := cmd()
+	msg, ok := raw.(providerWizardOAuthMsg)
 	if !ok {
-		t.Fatalf("poll command returned %T, want providerWizardOAuthMsg", msg)
+		t.Fatalf("poll command returned %T, want providerWizardOAuthMsg", raw)
 	}
 	if !errors.Is(msg.err, context.Canceled) {
 		t.Fatalf("poll error = %v, want context.Canceled (Esc should have canceled the background poll)", msg.err)
@@ -292,9 +293,10 @@ func TestModelQuitCancelsProviderWizardDeviceLoginPoll(t *testing.T) {
 		t.Fatal("quit should cancel the in-flight device-code poll")
 	}
 
-	msg, ok := cmd().(providerWizardOAuthMsg)
+	raw := cmd()
+	msg, ok := raw.(providerWizardOAuthMsg)
 	if !ok {
-		t.Fatalf("poll command returned %T, want providerWizardOAuthMsg", msg)
+		t.Fatalf("poll command returned %T, want providerWizardOAuthMsg", raw)
 	}
 	if !errors.Is(msg.err, context.Canceled) {
 		t.Fatalf("poll error = %v, want context.Canceled (quit should have canceled the background poll)", msg.err)

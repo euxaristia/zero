@@ -46,3 +46,26 @@ func TestProcessAliveNonPositiveIsDead(t *testing.T) {
 		t.Fatal("processAlive(-1) = true; want false")
 	}
 }
+
+func TestProcessAliveRunningChildIsLive(t *testing.T) {
+	cmd := exec.Command("powershell", "-Command", "Start-Sleep -Seconds 10")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	pid := cmd.Process.Pid
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+
+	if !processAlive(pid) {
+		t.Fatalf("processAlive(%d) = false while running; want true", pid)
+	}
+
+	_ = cmd.Process.Kill()
+	_ = cmd.Wait()
+
+	if processAlive(pid) {
+		t.Fatalf("processAlive(%d) = true after kill/wait; want false", pid)
+	}
+}

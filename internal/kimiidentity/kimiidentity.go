@@ -287,6 +287,9 @@ func repairAbandonedDeviceID(root *os.Root, name, id string) string {
 // holder's lock is restored rather than stolen.
 func reclaimDeadRepairLock(root *os.Root, lockName string) (bool, error) {
 	lockPath := filepath.Join(root.Name(), lockName)
+	if abs, err := filepath.Abs(lockPath); err == nil {
+		lockPath = abs
+	}
 	suffix := fmt.Sprintf("%d.%d", os.Getpid(), time.Now().UnixNano())
 	return lockutil.ReclaimStaleLock(lockPath, suffix, func(reclaimedPath string) bool {
 		raw, err := os.ReadFile(reclaimedPath)

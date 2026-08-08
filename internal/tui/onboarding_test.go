@@ -2154,9 +2154,10 @@ func TestSetupCtrlCCancelsDeviceLoginPoll(t *testing.T) {
 		t.Fatal("Ctrl+C should cancel the in-flight device-code poll")
 	}
 
-	msg, ok := cmd().(setupOAuthMsg)
+	raw := cmd()
+	msg, ok := raw.(setupOAuthMsg)
 	if !ok {
-		t.Fatalf("poll command returned %T, want setupOAuthMsg", msg)
+		t.Fatalf("poll command returned %T, want setupOAuthMsg", raw)
 	}
 	if !errors.Is(msg.err, context.Canceled) {
 		t.Fatalf("poll error = %v, want context.Canceled (Ctrl+C should have canceled the background poll)", msg.err)
