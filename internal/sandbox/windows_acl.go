@@ -130,35 +130,6 @@ func BuildWindowsACLPlan(config WindowsSandboxCommandConfig) (WindowsACLPlan, er
 		}
 	}
 
-	// Shared-path DenyWrite mitigations (C:\, ProgramData, Windows\Temp,
-	// Users\Public) existed only to compensate for Users/Authenticated Users
-	// SID broadening on fully restricted DenyRead tokens. That broadening is
-	// permanently disabled (see runWindowsSandboxCommand): preflight DACL
-	// snapshots cannot enforce a write boundary for the command's lifetime.
-	// Do not stamp new machine-wide DenyWrite ACEs for a feature that never
-	// enables. Still revoke the stable read-only capability SID on every
-	// elevated write root so hosts that ran earlier PR builds (which did apply
-	// shared/descendant denies) do not keep a stale deny that wins over the
-	// write root's Allow. Production callers reject DenyRead before planning,
-	// so gating this cleanup on DenyRead would leave it unreachable; revoking
-	// a missing ACE is a safe no-op.
-	if config.SandboxLevel == WindowsSandboxLevelRestrictedToken && len(writeCapabilities) > 0 {
-		caps, err := LoadOrCreateWindowsCapabilitySIDs(config.SandboxHome)
-		if err != nil {
-			return WindowsACLPlan{}, err
-		}
-		denySID := caps.ReadOnly
-		for _, capability := range writeCapabilities {
-			entries = append(entries, WindowsACLEntry{
-				Action:            WindowsACLRevokeCapability,
-				Path:              capability.Root,
-				Capability:        denySID,
-				NoInherit:         true,
-				RevokeDescendants: true,
-			})
-		}
-	}
-
 	return WindowsACLPlan{Entries: dedupeWindowsACLEntries(entries)}, nil
 }
 

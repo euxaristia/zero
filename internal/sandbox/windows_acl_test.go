@@ -55,28 +55,17 @@ func TestBuildWindowsACLPlanForWorkspaceWriteProfile(t *testing.T) {
 	assertWindowsACLEntry(t, plan, WindowsACLDenyRead, `C:\workspace\secret-read`, cacheSID, true)
 
 	// SID broadening is disabled, so the plan must not stamp shared system-path
-	// DenyWrite ACEs. Write roots still get a revoke of the stable read-only
-	// SID so earlier PR builds' stale denies cannot shadow new Allows.
-	caps, err := LoadOrCreateWindowsCapabilitySIDs(home)
-	if err != nil {
-		t.Fatalf("LoadOrCreateWindowsCapabilitySIDs: %v", err)
-	}
+	// DenyWrite ACEs or revoke legacy capability SIDs. Revocation could weaken
+	// the boundary of a command launched by an earlier build.
 	assertNoSharedSystemDenyWrites(t, plan)
-	for _, root := range []string{`C:\workspace`, `D:\cache`} {
-		assertWindowsACLRevoke(t, plan, root, caps.ReadOnly, true)
-	}
+	assertNoWindowsACLRevokes(t, plan)
 }
 
 // TestBuildWindowsACLPlanOmitsSharedDenyPathsWithoutDenyRead pins that
-// profiles without DenyRead never stamp shared system-path DenyWrite ACEs.
-// Elevated write roots still get a migration revoke of the stable read-only
-// SID so stale denies from earlier PR builds cannot shadow new Allows.
+// profiles without DenyRead never stamp shared system-path DenyWrite ACEs or
+// revoke old capability-SID guards that a running sandbox may still require.
 func TestBuildWindowsACLPlanOmitsSharedDenyPathsWithoutDenyRead(t *testing.T) {
 	home := t.TempDir()
-	caps, err := LoadOrCreateWindowsCapabilitySIDs(home)
-	if err != nil {
-		t.Fatalf("LoadOrCreateWindowsCapabilitySIDs: %v", err)
-	}
 	plan, err := BuildWindowsACLPlan(WindowsSandboxCommandConfig{
 		SandboxHome:    home,
 		WorkspaceRoots: []string{`C:\workspace`},
@@ -93,7 +82,7 @@ func TestBuildWindowsACLPlanOmitsSharedDenyPathsWithoutDenyRead(t *testing.T) {
 		t.Fatalf("BuildWindowsACLPlan: %v", err)
 	}
 	assertNoSharedSystemDenyWrites(t, plan)
-	assertWindowsACLRevoke(t, plan, `C:\workspace`, caps.ReadOnly, true)
+	assertNoWindowsACLRevokes(t, plan)
 }
 
 // TestBuildWindowsACLPlanOmitsSharedDenyPathsWhenUnelevated pins that the
@@ -197,28 +186,20 @@ func TestBuildWindowsACLPlanDisablesSharedDenyPathDescendantScan(t *testing.T) {
 	}
 }
 
-// TestBuildWindowsACLPlanRevokesStaleSharedDenyOnWriteRoot pins cleanup for
-// hosts that ran earlier PR builds which stamped shared/descendant DenyWrite
-// ACEs: elevated write roots get an unconditional revoke of the stable
-// read-only SID (with RevokeDescendants), independent of DenyRead (which
-// production callers reject before planning).
-func TestBuildWindowsACLPlanRevokesStaleSharedDenyOnWriteRoot(t *testing.T) {
+// TestBuildWindowsACLPlanDoesNotRevokeLegacyGuards pins that a setup run does
+// not remove persistent guards installed by an older build. A previously
+// launched sandbox can still carry the legacy capability SID, so removing its
+// deny would widen that process's access.
+func TestBuildWindowsACLPlanDoesNotRevokeLegacyGuards(t *testing.T) {
 	home := t.TempDir()
-	caps, err := LoadOrCreateWindowsCapabilitySIDs(home)
-	if err != nil {
-		t.Fatalf("LoadOrCreateWindowsCapabilitySIDs: %v", err)
-	}
-	systemDrive, _, _, publicDir := windowsSharedDenyPathsForTest(t)
-	promotedDescendant := systemDrive + `\Users\shared`
-
 	plan, err := BuildWindowsACLPlan(WindowsSandboxCommandConfig{
 		SandboxHome:    home,
-		WorkspaceRoots: []string{publicDir, promotedDescendant},
+		WorkspaceRoots: []string{`C:\workspace`},
 		SandboxLevel:   WindowsSandboxLevelRestrictedToken,
 		PermissionProfile: PermissionProfile{
 			FileSystem: FileSystemPolicy{
 				Kind:       FileSystemRestricted,
-				WriteRoots: []WritableRoot{{Root: publicDir}, {Root: promotedDescendant}},
+				WriteRoots: []WritableRoot{{Root: `C:\workspace`}},
 			},
 			Network: NetworkPolicy{Mode: NetworkDeny},
 		},
@@ -226,13 +207,7 @@ func TestBuildWindowsACLPlanRevokesStaleSharedDenyOnWriteRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildWindowsACLPlan: %v", err)
 	}
-	assertNoSharedSystemDenyWrites(t, plan)
-	for _, root := range []string{publicDir, promotedDescendant} {
-		assertWindowsACLRevoke(t, plan, root, caps.ReadOnly, true)
-		// Exercise the inheritance helper with noInherit=true so both
-		// inheritance states are validated, not just the inheritable default.
-		assertWindowsACLEntryInheritance(t, plan, WindowsACLRevokeCapability, root, caps.ReadOnly, false, true)
-	}
+	assertNoWindowsACLRevokes(t, plan)
 }
 
 func assertNoSharedSystemDenyWrites(t *testing.T, plan WindowsACLPlan) {
@@ -247,22 +222,13 @@ func assertNoSharedSystemDenyWrites(t *testing.T, plan WindowsACLPlan) {
 	}
 }
 
-func assertWindowsACLRevoke(t *testing.T, plan WindowsACLPlan, path, capability string, revokeDescendants bool) {
+func assertNoWindowsACLRevokes(t *testing.T, plan WindowsACLPlan) {
 	t.Helper()
 	for _, entry := range plan.Entries {
-		if entry.Action == WindowsACLRevokeCapability &&
-			windowsCapabilityPathKey(entry.Path) == windowsCapabilityPathKey(path) &&
-			strings.EqualFold(entry.Capability, capability) {
-			if entry.RevokeDescendants != revokeDescendants {
-				t.Fatalf("revoke on %q RevokeDescendants=%v, want %v", path, entry.RevokeDescendants, revokeDescendants)
-			}
-			if !entry.NoInherit {
-				t.Fatalf("revoke on %q NoInherit=false, want true: an inheritable revoke would propagate across the write root's existing subtree", path)
-			}
-			return
+		if entry.Action == WindowsACLRevokeCapability {
+			t.Fatalf("plan = %#v, want no WindowsACLRevokeCapability entries", plan.Entries)
 		}
 	}
-	t.Fatalf("plan = %#v, want WindowsACLRevokeCapability on %q for %q", plan.Entries, path, capability)
 }
 
 func TestBuildWindowsACLPlanRejectsUnrestrictedProfiles(t *testing.T) {
