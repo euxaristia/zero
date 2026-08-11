@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -317,11 +316,11 @@ func dirDeniesReadSID(t *testing.T, path, wantSID string) bool {
 		if err := windows.GetAce(dacl, uint32(index), &ace); err != nil {
 			t.Fatalf("GetAce %d of %s: %v", index, path, err)
 		}
-		if ace.Header.AceType != windows.ACCESS_DENIED_ACE_TYPE {
+		if ace.Header.AceType != windows.ACCESS_DENIED_ACE_TYPE && ace.Header.AceType != windowsAccessDeniedObjectAceType {
 			continue
 		}
-		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
-		if !sid.Equals(want) {
+		sid, ok := windowsAceSID(ace)
+		if !ok || !sid.Equals(want) {
 			continue
 		}
 		if ace.Mask&readMask == readMask && !windowsIsExperimentalWriteDenyMask(ace.Mask) {

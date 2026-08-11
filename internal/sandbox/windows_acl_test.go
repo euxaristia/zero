@@ -229,6 +229,9 @@ func TestBuildWindowsACLPlanRevokesStaleSharedDenyOnWriteRoot(t *testing.T) {
 	assertNoSharedSystemDenyWrites(t, plan)
 	for _, root := range []string{publicDir, promotedDescendant} {
 		assertWindowsACLRevoke(t, plan, root, caps.ReadOnly, true)
+		// Exercise the inheritance helper with noInherit=true so both
+		// inheritance states are validated, not just the inheritable default.
+		assertWindowsACLEntryInheritance(t, plan, WindowsACLRevokeCapability, root, caps.ReadOnly, false, true)
 	}
 }
 
@@ -252,6 +255,9 @@ func assertWindowsACLRevoke(t *testing.T, plan WindowsACLPlan, path, capability 
 			strings.EqualFold(entry.Capability, capability) {
 			if entry.RevokeDescendants != revokeDescendants {
 				t.Fatalf("revoke on %q RevokeDescendants=%v, want %v", path, entry.RevokeDescendants, revokeDescendants)
+			}
+			if !entry.NoInherit {
+				t.Fatalf("revoke on %q NoInherit=false, want true: an inheritable revoke would propagate across the write root's existing subtree", path)
 			}
 			return
 		}
