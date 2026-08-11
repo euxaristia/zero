@@ -259,7 +259,14 @@ func fetchRelease(ctx context.Context, endpoint string) (release Release, err er
 	} else if token := os.Getenv("GITHUB_TOKEN"); token != "" && request.URL.Scheme == "https" && strings.EqualFold(request.URL.Hostname(), "api.github.com") {
 		request.Header.Set("Authorization", "Bearer "+token)
 	}
-	response, err := http.DefaultClient.Do(request)
+	client := *http.DefaultClient
+	client.CheckRedirect = func(request *http.Request, via []*http.Request) error {
+		if request.URL.Scheme != "https" || !strings.EqualFold(request.URL.Hostname(), "api.github.com") {
+			request.Header.Del("Authorization")
+		}
+		return nil
+	}
+	response, err := client.Do(request)
 	if err != nil {
 		return Release{}, err
 	}

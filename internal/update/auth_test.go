@@ -108,6 +108,46 @@ func TestFetchReleaseNoAuthToHttpGithub(t *testing.T) {
 	}
 }
 
+func TestFetchReleaseStripsAuthAcrossInsecureRedirect(t *testing.T) {
+	at := &redirectAuthTransport{t: t}
+	oldClient := http.DefaultClient
+	http.DefaultClient = &http.Client{Transport: at}
+	t.Cleanup(func() { http.DefaultClient = oldClient })
+
+	t.Setenv(EnvUpdateToken, "secret")
+	t.Setenv("GITHUB_TOKEN", "")
+
+	_, err := fetchRelease(context.Background(), "https://api.github.com/repos/Gitlawb/zero/releases/latest")
+	if err != nil {
+		t.Logf("fetchRelease returned error (expected for fake response): %v", err)
+	}
+	if len(at.receivedAuth) != 2 || at.receivedAuth[0] != "Bearer secret" || at.receivedAuth[1] != "" {
+		t.Fatalf("redirected request authorization = %#v, want initial bearer followed by empty", at.receivedAuth)
+	}
+}
+
+type redirectAuthTransport struct {
+	t            *testing.T
+	receivedAuth []string
+}
+
+func (at *redirectAuthTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	at.receivedAuth = append(at.receivedAuth, req.Header.Get("Authorization"))
+	if len(at.receivedAuth) == 1 {
+		return &http.Response{
+			StatusCode: http.StatusFound,
+			Header:     http.Header{"Location": []string{"http://api.github.com/repos/Gitlawb/zero/releases/latest"}},
+			Body:       io.NopCloser(strings.NewReader("")),
+			Request:    req,
+		}, nil
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(`{"tag_name":"v0.2.0"}`)),
+		Header:     make(http.Header),
+		Request:    req,
+	}, nil
+}
 func TestFetchReleaseNoAuthWhenTokensNotSet(t *testing.T) {
 	// No env vars set → no auth sent (authenticated fallback)
 	at := &authTransport{t: t}
