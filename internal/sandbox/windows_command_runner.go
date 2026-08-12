@@ -55,7 +55,7 @@ func windowsDenyReadRestrictedTokenUnsupportedProfile(profile PermissionProfile)
 			"restricting SID set, ordinary system binaries under Program Files and "+
 			"Windows cannot load, and adding those groups would admit their existing "+
 			"write grants outside WriteRoots. "+
-			"Use `--sandbox forbid`, omit DenyRead, or wait for access-time confinement "+
+			"Remove DenyRead from this configuration or use the documented sandbox_permissions require_escalated approval flow; that flow cannot preserve DenyRead. "+
 			"(AppContainer/LPAC-style). Configured DenyRead path count: %d",
 		len(profile.FileSystem.DenyRead),
 	)

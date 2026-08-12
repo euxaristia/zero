@@ -35,9 +35,11 @@ func TestWindowsDenyReadRestrictedTokenUnsupported(t *testing.T) {
 				t.Fatalf("%s error leaked DenyRead path %q: %q", level, secret, msg)
 			}
 		}
-		// Must not point users at the other restricted-token tier as a workaround.
-		if strings.Contains(msg, "Use `--sandbox forbid`, the unelevated") {
-			t.Fatalf("%s error still recommends unelevated as a DenyRead workaround: %q", level, msg)
+		if strings.Contains(msg, "--sandbox forbid") {
+			t.Fatalf("%s error advertises unsupported --sandbox forbid recovery: %q", level, msg)
+		}
+		if !strings.Contains(msg, "sandbox_permissions") {
+			t.Fatalf("%s error should name the documented sandbox_permissions recovery flow: %q", level, msg)
 		}
 	}
 
