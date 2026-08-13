@@ -69,6 +69,7 @@ func runBashToolHelper(command string) {
 		}
 		fmt.Println("listening", listener.Addr().String())
 		server := &http.Server{
+			ReadHeaderTimeout: 5 * time.Second,
 			Handler: http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 				_, _ = response.Write([]byte("zero-server-ok"))
 			}),

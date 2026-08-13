@@ -79,26 +79,29 @@ func OpenRouterLogin(ctx context.Context, opts OpenRouterOptions) (string, error
 
 	codeCh := make(chan string, 1)
 	errCh := make(chan error, 1)
-	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/callback" {
-			http.NotFound(w, r)
-			return
-		}
-		if code := strings.TrimSpace(r.URL.Query().Get("code")); code != "" {
-			_, _ = io.WriteString(w, "OpenRouter authorization complete. You may close this window.")
+	server := &http.Server{
+		ReadHeaderTimeout: 5 * time.Second,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/callback" {
+				http.NotFound(w, r)
+				return
+			}
+			if code := strings.TrimSpace(r.URL.Query().Get("code")); code != "" {
+				_, _ = io.WriteString(w, "OpenRouter authorization complete. You may close this window.")
+				select {
+				case codeCh <- code:
+				default:
+				}
+				return
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, "Authorization failed. You may close this window.")
 			select {
-			case codeCh <- code:
+			case errCh <- errors.New("provideroauth: callback missing authorization code"):
 			default:
 			}
-			return
-		}
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = io.WriteString(w, "Authorization failed. You may close this window.")
-		select {
-		case errCh <- errors.New("provideroauth: callback missing authorization code"):
-		default:
-		}
-	})}
+		}),
+	}
 	go func() { _ = server.Serve(listener) }()
 	defer func() {
 		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), time.Second)
