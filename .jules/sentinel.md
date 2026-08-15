@@ -1,0 +1,4 @@
+## 2026-08-15 - Mitigate Potential Slowloris Attacks in OAuth Callbacks
+**Vulnerability:** Go's `http.Server` was initialized without a `ReadHeaderTimeout` in three OAuth callback handlers (`/app/internal/provideroauth/openrouter.go`, `/app/internal/oauth/loopback.go`, and `/app/internal/mcp/oauth.go`).
+**Learning:** This missing configuration leaves the local server vulnerable to Slowloris attacks (CWE-400), where an attacker opens many connections and sends headers very slowly, exhausting server resources and preventing legitimate clients from connecting. Even though these are local loopback servers for OAuth flows, it's best practice to configure timeouts to prevent local DoS.
+**Prevention:** Always configure `ReadHeaderTimeout` when initializing an `http.Server` instance. Example: `server := &http.Server{ReadHeaderTimeout: 3 * time.Second, Handler: ...}`
