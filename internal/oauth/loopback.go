@@ -50,10 +50,7 @@ func NewLoopbackListenerOnPort(state string, port int) (*LoopbackListener, error
 		state:    state,
 		result:   make(chan callbackResult, 1),
 	}
-	l.server = &http.Server{
-		ReadHeaderTimeout: 3 * time.Second,
-		Handler:           http.HandlerFunc(l.handle),
-	}
+	l.server = &http.Server{Handler: http.HandlerFunc(l.handle)}
 	go func() { _ = l.server.Serve(ln) }()
 	return l, nil
 }

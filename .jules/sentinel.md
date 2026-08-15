@@ -1,4 +1,4 @@
-## 2026-08-15 - Mitigate Potential Slowloris Attacks in OAuth Callbacks
-**Vulnerability:** Go's `http.Server` was initialized without a `ReadHeaderTimeout` in three OAuth callback handlers (`/app/internal/provideroauth/openrouter.go`, `/app/internal/oauth/loopback.go`, and `/app/internal/mcp/oauth.go`).
-**Learning:** This missing configuration leaves the local server vulnerable to Slowloris attacks (CWE-400), where an attacker opens many connections and sends headers very slowly, exhausting server resources and preventing legitimate clients from connecting. Even though these are local loopback servers for OAuth flows, it's best practice to configure timeouts to prevent local DoS.
-**Prevention:** Always configure `ReadHeaderTimeout` when initializing an `http.Server` instance. Example: `server := &http.Server{ReadHeaderTimeout: 3 * time.Second, Handler: ...}`
+## 2026-08-15 - Excessive memory allocation during VP8L decoding in golang.org/x/image
+**Vulnerability:** The `golang.org/x/image` package (specifically `v0.44.0`) is vulnerable to excessive memory allocation during VP8L decoding (`GO-2026-6222`). This could be exploited by providing a specially crafted image to trigger a denial of service.
+**Learning:** Outdated dependencies with known CVEs pose a significant security risk, especially when processing external inputs like images in `terminalpet.decodeImage`.
+**Prevention:** Regularly scan dependencies with `make vulncheck` (which runs `govulncheck`) in CI and locally. Promptly update vulnerable dependencies (e.g., `go get golang.org/x/image@v0.45.0`) to secure versions.

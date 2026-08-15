@@ -409,7 +409,6 @@ func Login(ctx context.Context, options LoginOptions) (StoredToken, error) {
 	}
 	resultChan := make(chan callbackResult, 1)
 	server := &http.Server{
-		ReadHeaderTimeout: 3 * time.Second,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path != "/callback" {
 				http.NotFound(w, r)
