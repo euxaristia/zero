@@ -55,15 +55,13 @@ func TestBuildWindowsACLPlanForWorkspaceWriteProfile(t *testing.T) {
 	assertWindowsACLEntry(t, plan, WindowsACLDenyRead, `C:\workspace\secret-read`, cacheSID, true)
 
 	// SID broadening is disabled, so the plan must not stamp shared system-path
-	// DenyWrite ACEs or revoke legacy capability SIDs. Revocation could weaken
-	// the boundary of a command launched by an earlier build.
+	// DenyWrite ACEs or unexpected actions.
 	assertNoSharedSystemDenyWrites(t, plan)
-	assertNoWindowsACLRevokes(t, plan)
+	assertOnlyAllowAndDenyActions(t, plan)
 }
 
 // TestBuildWindowsACLPlanOmitsSharedDenyPathsWithoutDenyRead pins that
-// profiles without DenyRead never stamp shared system-path DenyWrite ACEs or
-// revoke old capability-SID guards that a running sandbox may still require.
+// profiles without DenyRead never stamp shared system-path DenyWrite ACEs.
 func TestBuildWindowsACLPlanOmitsSharedDenyPathsWithoutDenyRead(t *testing.T) {
 	home := t.TempDir()
 	plan, err := BuildWindowsACLPlan(WindowsSandboxCommandConfig{
@@ -82,7 +80,7 @@ func TestBuildWindowsACLPlanOmitsSharedDenyPathsWithoutDenyRead(t *testing.T) {
 		t.Fatalf("BuildWindowsACLPlan: %v", err)
 	}
 	assertNoSharedSystemDenyWrites(t, plan)
-	assertNoWindowsACLRevokes(t, plan)
+	assertOnlyAllowAndDenyActions(t, plan)
 }
 
 // TestBuildWindowsACLPlanOmitsSharedDenyPathsWhenUnelevated pins that the
@@ -107,11 +105,7 @@ func TestBuildWindowsACLPlanOmitsSharedDenyPathsWhenUnelevated(t *testing.T) {
 		t.Fatalf("BuildWindowsACLPlan: %v", err)
 	}
 	assertNoSharedSystemDenyWrites(t, plan)
-	for _, entry := range plan.Entries {
-		if entry.Action == WindowsACLRevokeCapability {
-			t.Fatalf("unelevated plan = %#v, want no WindowsACLRevokeCapability entry", plan.Entries)
-		}
-	}
+	assertOnlyAllowAndDenyActions(t, plan)
 }
 
 // windowsSharedDenyPathsForTest calls the same trusted-path resolution
@@ -207,7 +201,7 @@ func TestBuildWindowsACLPlanDoesNotRevokeLegacyGuards(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildWindowsACLPlan: %v", err)
 	}
-	assertNoWindowsACLRevokes(t, plan)
+	assertOnlyAllowAndDenyActions(t, plan)
 }
 
 func assertNoSharedSystemDenyWrites(t *testing.T, plan WindowsACLPlan) {
@@ -222,11 +216,13 @@ func assertNoSharedSystemDenyWrites(t *testing.T, plan WindowsACLPlan) {
 	}
 }
 
-func assertNoWindowsACLRevokes(t *testing.T, plan WindowsACLPlan) {
+func assertOnlyAllowAndDenyActions(t *testing.T, plan WindowsACLPlan) {
 	t.Helper()
 	for _, entry := range plan.Entries {
-		if entry.Action == WindowsACLRevokeCapability {
-			t.Fatalf("plan = %#v, want no WindowsACLRevokeCapability entries", plan.Entries)
+		switch entry.Action {
+		case WindowsACLAllowWrite, WindowsACLDenyRead, WindowsACLDenyWrite:
+		default:
+			t.Fatalf("plan = %#v, unexpected entry action %q", plan.Entries, entry.Action)
 		}
 	}
 }

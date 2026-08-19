@@ -287,9 +287,7 @@ func selfUserSID(t *testing.T) *windows.SID {
 //
 // deny=false restores access via SET_ACCESS with a zero mask rather than
 // REVOKE_ACCESS: empirically, SetEntriesInAclW's REVOKE_ACCESS mode does not
-// remove a pre-existing DENY ACE for the trustee (verified directly against
-// this code path — see the same finding in BuildWindowsACLPlan's
-// WindowsACLRevokeCapability, windows_acl_apply_windows.go), so relying on it
+// remove a pre-existing DENY ACE for the trustee, so relying on it
 // here would leave the test process permanently denied FILE_LIST_DIRECTORY on
 // its own temp fixture.
 func setSelfListDirectoryAccess(t *testing.T, path string, deny bool) {
